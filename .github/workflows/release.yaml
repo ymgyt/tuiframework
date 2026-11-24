@@ -1,0 +1,35 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v32
+
+      - name: Check that the tag matches the crate version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          version=$(nix develop --command cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "tuiframework") | .version')
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::Expected v$version for this Cargo.toml, got $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - run: nix develop --command just check
+      - run: nix develop --command cargo publish --locked --dry-run
+
+      - name: Publish to crates.io
+        if: github.event_name == 'push'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: nix develop --command cargo publish --locked --registry crates-io
