@@ -22,9 +22,15 @@ impl KeyStroke {
         Self { code, modifiers }
     }
 
-    /// Convert `Char` keys into the canonical spelling: an uppercase char
-    /// always carries SHIFT, and a SHIFT-modified char is always uppercase.
-    fn normalize_case(mut self) -> Self {
+    /// Terminals can report either a base key plus Shift or its shifted key code.
+    fn normalized(mut self) -> Self {
+        if self.code == KeyCode::BackTab
+            || (self.code == KeyCode::Tab && self.modifiers.contains(KeyModifiers::SHIFT))
+        {
+            self.code = KeyCode::BackTab;
+            self.modifiers.insert(KeyModifiers::SHIFT);
+            return self;
+        }
         let KeyCode::Char(ch) = self.code else {
             return self;
         };
@@ -41,7 +47,8 @@ impl KeyStroke {
     }
 
     pub fn help_label(self) -> String {
-        match (self.modifiers, self.code) {
+        let key = self.normalized();
+        match (key.modifiers, key.code) {
             (KeyModifiers::NONE, KeyCode::Enter) => "Ent".into(),
             (KeyModifiers::NONE, KeyCode::Char(' ')) => "Sp".into(),
             (KeyModifiers::NONE, KeyCode::Tab) => "Tab".into(),
@@ -54,7 +61,7 @@ impl KeyStroke {
         if !(self.modifiers - KeyModifiers::SHIFT).is_empty() {
             return None;
         }
-        match self.code {
+        match self.normalized().code {
             KeyCode::Char(ch) => Some(ch),
             _ => None,
         }
@@ -63,8 +70,8 @@ impl KeyStroke {
 
 impl PartialEq for KeyStroke {
     fn eq(&self, other: &Self) -> bool {
-        let lhs = self.normalize_case();
-        let rhs = other.normalize_case();
+        let lhs = self.normalized();
+        let rhs = other.normalized();
         lhs.code == rhs.code && lhs.modifiers == rhs.modifiers
     }
 }
@@ -73,7 +80,7 @@ impl Eq for KeyStroke {}
 
 impl std::hash::Hash for KeyStroke {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let normalized = self.normalize_case();
+        let normalized = self.normalized();
         normalized.code.hash(state);
         normalized.modifiers.hash(state);
     }

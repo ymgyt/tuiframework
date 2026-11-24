@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use tuiframework::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tuiframework::keymap::{
     Binding, KeySequence, KeyStroke, Keymap, KeymapConfig, KeymapError, LayerKeymap, LayerStack,
     Resolution,
@@ -175,6 +176,16 @@ fn explicit_keys_and_prefixes_win_over_a_text_fallback_in_their_layer() {
             .collect::<Vec<_>>(),
         ["1", "g g"]
     );
+    // The enhanced keyboard protocol can report the base character plus Shift.
+    let shifted = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::SHIFT);
+    assert_eq!(
+        map.resolve(&layers, shifted.into()),
+        Resolution::Matched {
+            layer: Layer::Prompt,
+            owner: 2,
+            command: Command::Text('R'),
+        }
+    );
     assert_eq!(map.layer_for(&layers, key("q")), Some(Layer::Prompt));
     assert_eq!(map.resolve(&layers, key("g")), Resolution::Pending);
     assert_eq!(map.hints(&layers)[0].keys, "g");
@@ -219,6 +230,15 @@ fn config_rejects_ambiguous_prefixes_and_equivalent_keys() {
             Err(KeymapError::Ambiguous(_))
         ));
     }
+    let mut map = LayerKeymap::default();
+    map.bind(binding("S-tab", Command::First)).unwrap();
+    assert!(matches!(
+        map.bind(binding("backtab", Command::Last)),
+        Err(KeymapError::Duplicate(_))
+    ));
+    let from_terminal = KeyStroke::from(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+    assert_eq!(key("S-tab"), from_terminal);
+    assert_eq!(key("S-tab").help_label(), "S-Tab");
     let user = toml::from_str(
         r#"[list]
         keymap = [{on = "G", command = "first"}, {on = "S-g", command = "last"}]"#,
