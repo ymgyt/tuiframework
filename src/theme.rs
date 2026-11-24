@@ -76,9 +76,10 @@ impl Default for Palette {
     }
 }
 
-/// Common styles for a screen, its labels, and its selected item.
+/// Optional shared styles. An application can embed these alongside its own
+/// roles or define its theme entirely from Ratatui styles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Theme {
+pub struct Styles {
     pub palette: Palette,
     pub base: Style,
     pub title: Style,
@@ -88,7 +89,7 @@ pub struct Theme {
     pub error: Style,
 }
 
-impl From<Palette> for Theme {
+impl From<Palette> for Styles {
     fn from(palette: Palette) -> Self {
         let base = Style::new().fg(palette.foreground).bg(palette.background);
         Self {
@@ -103,7 +104,7 @@ impl From<Palette> for Theme {
     }
 }
 
-impl Default for Theme {
+impl Default for Styles {
     fn default() -> Self {
         Palette::default().into()
     }

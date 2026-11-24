@@ -1,4 +1,4 @@
-use futures_util::{StreamExt as _, stream};
+use futures_util::stream;
 use std::cell::Cell;
 use tuiframework::{
     crossterm::event::{Event as Input, KeyEvent, KeyEventKind},
@@ -23,34 +23,41 @@ fn key(notation: &str) -> Input {
     Input::Key(notation.parse::<KeyStroke>().unwrap().into())
 }
 
-async fn screen(keys: Vec<Input>) -> (String, usize) {
-    let reads = Cell::new(0);
-    let mut application =
-        Application::new(Files::new(".".into()), Fixture(&reads), keymap().unwrap());
-    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-    // The first input arrives after the queued directory result.
-    let mut input = Box::pin(
-        stream::once(async {
-            tokio::task::yield_now().await;
-            Ok(Input::FocusGained)
-        })
-        .chain(stream::iter(keys.into_iter().map(Ok))),
-    );
-    application
-        .run_with(&mut terminal, &mut input)
-        .await
-        .unwrap();
+fn application<D: Driver<Files>>(driver: D) -> Application<Files, D> {
+    Application::builder()
+        .components(Files::new(".".into(), Palette::ferra().into()))
+        .driver(driver)
+        .keymap(keymap().unwrap())
+        .build()
+}
+
+fn rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
     let buffer = terminal.backend().buffer();
-    let rows = buffer
+    buffer
         .content()
-        .chunks(100)
+        .chunks(usize::from(buffer.area.width))
         .map(|row| {
             row.iter()
                 .map(tuiframework::ratatui::buffer::Cell::symbol)
                 .collect::<String>()
+                .trim_end()
+                .to_owned()
         })
-        .collect::<Vec<_>>();
-    (rows.join("\n"), reads.get())
+        .collect()
+}
+
+async fn screen(keys: Vec<Input>) -> (String, usize) {
+    let reads = Cell::new(0);
+    let mut app = application(Fixture(&reads));
+    let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+    app.render(&mut terminal).unwrap();
+    while app.has_pending_work() {
+        app.step(&mut stream::pending()).await.unwrap();
+    }
+    app.run_with(&mut terminal, &mut stream::iter(keys.into_iter().map(Ok)))
+        .await
+        .unwrap();
+    (rows(&terminal).join("\n"), reads.get())
 }
 
 #[tokio::test]
@@ -77,4 +84,51 @@ async fn applying_sort_updates_the_base_screen_and_restores_its_bindings() {
     assert!(screen.contains("> charlie"));
     assert!(screen.contains("r reload"));
     assert!(!screen.contains("Sort files"));
+}
+
+/// The listing stays in its loading state until the test supplies a result.
+struct PendingRead;
+
+impl Driver<Files> for PendingRead {
+    fn dispatch(&mut self, _: Operation, _: &mut DriverContext<Event>) {}
+}
+
+#[test]
+fn moving_back_up_keeps_the_viewport_and_resizing_keeps_the_selection() {
+    let mut app = application(PendingRead);
+    let mut terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
+    app.publish(&Event::Loaded(Ok(["alpha", "bravo", "charlie", "delta"]
+        .map(str::to_owned)
+        .into())));
+    for _ in 0..3 {
+        app.send(Id::Files, Command::Next);
+        app.render(&mut terminal).unwrap();
+    }
+    assert_eq!(&rows(&terminal)[1..4], ["  bravo", "  charlie", "> delta"]);
+
+    app.send(Id::Files, Command::Previous);
+    app.render(&mut terminal).unwrap();
+    assert_eq!(&rows(&terminal)[1..4], ["  bravo", "> charlie", "  delta"]);
+
+    terminal.backend_mut().resize(24, 3);
+    app.render(&mut terminal).unwrap();
+    assert_eq!(rows(&terminal)[1], "> charlie");
+}
+
+#[tokio::test]
+async fn switching_theme_restyles_a_directory_read_in_progress() {
+    let mut app = application(PendingRead);
+    let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+    app.render(&mut terminal).unwrap();
+    assert_eq!(
+        terminal.backend().buffer()[(0, 0)].fg,
+        Palette::ferra().accent
+    );
+
+    let mut input = stream::iter([Ok(key("t")), Ok(key("q"))]);
+    app.run_with(&mut terminal, &mut input).await.unwrap();
+    assert!(rows(&terminal)[0].contains("loading"));
+    let header = &terminal.backend().buffer()[(0, 0)];
+    assert_eq!(header.fg, Palette::dracula().accent);
+    assert_eq!(header.bg, Palette::dracula().background);
 }

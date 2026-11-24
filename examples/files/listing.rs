@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{cell::Cell, path::PathBuf, sync::Arc};
 
 use tuiframework::{
     Component, Effects, RenderContext,
@@ -16,6 +16,7 @@ pub(super) struct Listing {
     path: PathBuf,
     names: Arc<[String]>,
     selected: usize,
+    offset: Cell<usize>,
     order: Order,
     pub(super) loading: bool,
     tick: usize,
@@ -28,6 +29,7 @@ impl Listing {
             path,
             names: Arc::default(),
             selected: 0,
+            offset: Cell::new(0),
             order: Order::default(),
             loading: false,
             tick: 0,
@@ -91,7 +93,7 @@ impl Component<Files> for Listing {
     }
 
     fn render(&self, frame: &mut Frame<'_>, cx: &RenderContext<'_, Files>) {
-        let theme = &cx.components.theme;
+        let theme = &cx.theme.common;
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
@@ -105,7 +107,12 @@ impl Component<Files> for Listing {
         } else {
             format!("{path}   {} files", self.names.len())
         };
-        frame.render_widget(Paragraph::new(title).style(theme.title), header);
+        let style = if self.loading {
+            cx.theme.loading
+        } else {
+            theme.title
+        };
+        frame.render_widget(Paragraph::new(title).style(style), header);
         if let Some(error) = &self.error {
             frame.render_widget(Paragraph::new(error.as_str()).style(theme.error), body);
         } else {
@@ -119,14 +126,15 @@ impl Component<Files> for Listing {
             let list = List::new(names)
                 .highlight_symbol("> ")
                 .highlight_style(theme.selected);
-            frame.render_stateful_widget(
-                list,
-                body,
-                &mut ListState::default().with_selected(Some(self.selected)),
-            );
+            let mut state = ListState::default()
+                .with_selected(Some(self.selected))
+                .with_offset(self.offset.get());
+            frame.render_stateful_widget(list, body, &mut state);
+            self.offset.set(state.offset());
         }
         let hints = cx
-            .hints()
+            .keymap
+            .hints(cx.layers)
             .into_iter()
             .filter_map(|h| h.description.map(|d| format!("{} {d}", h.keys)))
             .collect::<Vec<_>>();

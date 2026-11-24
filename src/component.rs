@@ -3,11 +3,11 @@ use std::hash::Hash;
 use crossterm::event::Event as TerminalEvent;
 use ratatui::{Frame, layout::Rect};
 
-use crate::keymap::{KeyHint, Keymap, LayerStack};
+use crate::keymap::{KeyBindings, Keymap, LayerStack};
 
 /// Keymap built from the command, layer, and component types of one application.
-pub type AppKeymap<A> =
-    Keymap<<A as Components>::Layer, <A as Components>::Binding, <A as Components>::Id>;
+pub type AppKeymap<A, B = <A as Components>::Command> =
+    Keymap<<A as Components>::Layer, B, <A as Components>::Id>;
 
 /// Resolves a binding to its destination and command once the active layer's
 /// owner is known. Binding a command directly sends it to that owner.
@@ -24,28 +24,38 @@ impl<A: Components> KeyAction<A> for A::Command {
 /// The app's vocabulary and concrete component store. An ID may address a
 /// nested field of another component.
 pub trait Components: Sized {
+    /// A stable address. A dynamic store should assign a fresh ID if an old
+    /// component's queued commands could outlive it.
     type Id: Copy + Eq;
     type Layer: Copy + Eq + Hash;
     type Command;
-    type Binding: Clone + KeyAction<Self>;
+    /// The compiled keymap shared by input dispatch and the render context.
+    type Keymap: KeyBindings<Self>;
     type Event;
     type Operation;
+    /// The application owns its current theme and may change it between frames.
+    type Theme: ?Sized;
+    fn theme(&self) -> &Self::Theme;
     /// Data shared by every component in one draw. Use `RenderContext<'a, Self>`
     /// directly or convert it into a view with a shared, app-specific layout.
     type View<'a>: From<RenderContext<'a, Self>>
     where
         Self: 'a;
 
-    /// Every component ID once, in event delivery order, including hidden components.
-    fn ids() -> impl IntoIterator<Item = Self::Id>;
+    /// Every currently registered ID once, in event delivery order, including
+    /// hidden components. Each published event takes its own snapshot.
+    fn ids(&self) -> impl IntoIterator<Item = Self::Id>;
 
-    fn component(&self, id: Self::Id) -> &dyn Component<Self>;
-    fn component_mut(&mut self, id: Self::Id) -> &mut dyn Component<Self>;
+    /// Looks up a component by ID. A dynamic store returns `None` for a
+    /// component that has closed since the ID was captured.
+    fn component(&self, id: Self::Id) -> Option<&dyn Component<Self>>;
+    fn component_mut(&mut self, id: Self::Id) -> Option<&mut dyn Component<Self>>;
 
     /// Handles an addressed command. Override this to route a domain command
     /// using sibling state, for example a filter command for the selected tab.
     fn command(&mut self, to: Self::Id, command: Self::Command) -> Effects<Self> {
-        self.component_mut(to).command(command)
+        self.component_mut(to)
+            .map_or(Effects::NONE, |component| component.command(command))
     }
 
     /// Visible component IDs, from the back of the screen to the front.
@@ -62,7 +72,7 @@ pub trait Components: Sized {
     }
 
     /// Install or reset runtime layers here when their backing data changes.
-    fn update_keymap(&mut self, _keymap: &mut AppKeymap<Self>) {}
+    fn update_keymap(&mut self, _keymap: &mut Self::Keymap) {}
 
     /// Enables timer wakeups while an animation is active.
     fn is_busy(&self) -> bool {
@@ -99,19 +109,21 @@ pub trait Component<A: Components> {
 /// The shared state and resolved input layers for the frame being drawn.
 pub struct RenderContext<'a, A: Components> {
     pub components: &'a A,
+    pub theme: &'a A::Theme,
     pub area: Rect,
     pub focused: bool,
-    pub keymap: &'a AppKeymap<A>,
+    pub keymap: &'a A::Keymap,
     pub layers: &'a LayerStack<A::Layer, A::Id>,
 }
 
-impl<A: Components> RenderContext<'_, A> {
-    pub fn hints(&self) -> Vec<KeyHint<'_, A::Layer, A::Binding>> {
-        self.keymap.hints(self.layers)
-    }
-}
-
 /// Facts, addressed commands, and external operations produced by one state transition.
+///
+/// Events reach subscribers in registration order. Each subscriber's nested
+/// events reach their subscribers before the next subscriber receives the
+/// original event. Once all those notifications finish, their replies run in
+/// that same depth-first completion order, followed by the originating reply.
+/// Each reply contributes its operations and runs its commands in order. The
+/// driver receives the collected operations after all commands have run.
 #[must_use]
 pub struct Effects<A: Components> {
     pub(crate) events: Vec<A::Event>,

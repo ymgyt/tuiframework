@@ -1,5 +1,8 @@
 [global]
-keymap = [{ on = "q", command = "quit", desc = "quit" }]
+keymap = [
+    { on = "q", command = "quit", desc = "quit" },
+    { on = "t", command = "toggle-theme", desc = "theme" },
+]
 
 [list]
 keymap = [

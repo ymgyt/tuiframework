@@ -88,24 +88,28 @@ impl Components for App {
     type Id = Id;
     type Layer = ();
     type Command = Command;
-    type Binding = NotifyObserver;
+    type Theme = ();
+    fn theme(&self) -> &() {
+        &()
+    }
+    type Keymap = AppKeymap<Self, NotifyObserver>;
     type Event = Event;
     type Operation = Hold;
     type View<'a> = RenderContext<'a, Self>;
-    fn ids() -> impl IntoIterator<Item = Id> {
+    fn ids(&self) -> impl IntoIterator<Item = Id> {
         [Id::Page, Id::Observer]
     }
-    fn component(&self, id: Id) -> &dyn Component<Self> {
-        match id {
+    fn component(&self, id: Id) -> Option<&dyn Component<Self>> {
+        Some(match id {
             Id::Page => &self.page,
             Id::Observer => &self.observer,
-        }
+        })
     }
-    fn component_mut(&mut self, id: Id) -> &mut dyn Component<Self> {
-        match id {
+    fn component_mut(&mut self, id: Id) -> Option<&mut dyn Component<Self>> {
+        Some(match id {
             Id::Page => &mut self.page,
             Id::Observer => &mut self.observer,
-        }
+        })
     }
     fn visible(&self) -> impl IntoIterator<Item = Id> {
         [Id::Page]
@@ -158,13 +162,14 @@ fn build_app(animating: bool) -> (Application<App, Jobs>, oneshot::Receiver<()>)
         },
     );
     (
-        Application::new(
-            app,
-            Jobs {
+        Application::builder()
+            .components(app)
+            .driver(Jobs {
                 sender: Some(sender),
-            },
-            AppKeymap::<App>::compile(keys).unwrap(),
-        ),
+            })
+            .keymap(AppKeymap::<App, NotifyObserver>::compile(keys).unwrap())
+            .tick_interval(std::time::Duration::from_secs(2))
+            .build(),
         receiver,
     )
 }
@@ -254,9 +259,8 @@ async fn only_busy_components_wake_the_loop_on_the_configured_interval() {
     use std::time::Duration;
 
     let (mut idle, _) = build_app(false);
-    let (busy, _) = build_app(true);
+    let (mut busy, _) = build_app(true);
     let period = Duration::from_secs(2);
-    let mut busy = busy.with_tick_interval(period);
     let mut input = stream::pending();
     busy.step(&mut input).await.unwrap();
     tokio::time::advance(period / 2).await;
@@ -271,4 +275,79 @@ async fn only_busy_components_wake_the_loop_on_the_configured_interval() {
             .borrow()
             .ends_with(&["tick", "tick"])
     );
+}
+
+#[tokio::test]
+async fn dropping_an_unpolled_run_stops_work_started_before_the_first_frame() {
+    let (mut app, mut dropped) = build_app(false);
+    app.send(Id::Observer, Command);
+    let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+    drop(app.run_with(&mut terminal, &mut stream::pending()));
+    assert!(app.is_finished());
+    assert!(!app.has_pending_work());
+    assert_eq!(
+        dropped.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn terminal_setup_failure_stops_prestarted_work() {
+    use std::io::IsTerminal as _;
+    if std::io::stdout().is_terminal() {
+        return;
+    }
+    let (mut app, mut dropped) = build_app(false);
+    app.send(Id::Observer, Command);
+    assert!(matches!(app.run().await, Err(RunError::Setup(_))));
+    assert!(app.is_finished());
+    assert_eq!(
+        dropped.try_recv(),
+        Err(oneshot::error::TryRecvError::Closed)
+    );
+}
+
+#[tokio::test]
+async fn idle_input_wakes_the_application_after_the_first_poll() {
+    use std::{
+        cell::Cell,
+        future::Future as _,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    #[derive(Default)]
+    struct Notification(AtomicBool);
+    impl Wake for Notification {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    // Crossterm's event reader saves the first pending poll's waker until input arrives.
+    let reader = RefCell::new(None);
+    let ready = Cell::new(false);
+    let mut input = stream::poll_fn(|cx| {
+        if ready.get() {
+            return Poll::Ready(Some(Ok(Input::FocusGained)));
+        }
+        reader
+            .borrow_mut()
+            .get_or_insert_with(|| cx.waker().clone());
+        Poll::Pending
+    });
+    let (mut app, _) = build_app(false);
+    let signal = Arc::new(Notification::default());
+    let waker = Waker::from(Arc::clone(&signal));
+    let mut cx = Context::from_waker(&waker);
+    let mut step = Box::pin(app.step(&mut input));
+    assert!(step.as_mut().poll(&mut cx).is_pending());
+    signal.0.store(false, Ordering::Release);
+    ready.set(true);
+    reader.borrow().as_ref().unwrap().wake_by_ref();
+    assert!(signal.0.load(Ordering::Acquire));
+    assert!(matches!(step.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
 }

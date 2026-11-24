@@ -52,6 +52,20 @@ impl<L: Copy + Eq, I: Copy> LayerStack<L, I> {
         }
     }
 
+    /// Layers from back to front, including reserved layers covered by a popup.
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = L> + '_ {
+        self.entries.iter().map(|entry| entry.layer)
+    }
+
+    /// Returns the component that can receive a command from this layer.
+    /// Covered and inactive layers have no available owner.
+    pub fn owner(&self, layer: L) -> Option<I> {
+        self.entries
+            .iter()
+            .find(|entry| entry.layer == layer && !entry.covered)
+            .map(|entry| entry.owner)
+    }
+
     pub fn top(&self) -> Option<L> {
         self.entries.last().map(|entry| entry.layer)
     }

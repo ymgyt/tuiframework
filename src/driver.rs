@@ -12,6 +12,13 @@ use futures_util::{
 };
 use tokio::sync::mpsc;
 
+/// A driver-owned source can publish a fact or schedule an operation, for
+/// example when a session refresh timer expires.
+pub enum DriverMessage<E, O> {
+    Event(E),
+    Operation(O),
+}
+
 /// Interprets the operations produced by a compositor. A driver can own API
 /// clients, caches and other application-specific resources.
 pub trait Driver<A: Components> {
@@ -21,8 +28,8 @@ pub trait Driver<A: Components> {
     fn dispatch(&mut self, operation: A::Operation, cx: &mut DriverContext<A::Event>);
 
     /// Polls sources owned by this driver, such as a credential renewal timer.
-    /// Return pending until the source can provide another event.
-    fn poll_event(&mut self, _cx: &mut Context<'_>) -> Poll<A::Event> {
+    /// Return pending until a source has work and arrange to wake the task.
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<DriverMessage<A::Event, A::Operation>> {
         Poll::Pending
     }
 }
@@ -30,6 +37,12 @@ pub trait Driver<A: Components> {
 /// Identifies a request for the lifetime of a running application loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId(u64);
+
+impl std::fmt::Display for RequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 impl RequestId {
     /// Constructs an ID for replaying or testing application events.
@@ -105,9 +118,9 @@ impl<E> DriverContext<E> {
             .checked_add(1)
             .expect("request IDs exhausted");
         // Reserve the start event's place ahead of any progress emitted by build.
-        while let Ok(event) = self.receiver.try_recv() {
-            self.ready.push_back(event);
-        }
+        let queued = self.receiver.len();
+        self.ready
+            .extend((0..queued).filter_map(|_| self.receiver.try_recv().ok()));
         let (started, future) = build(RequestContext {
             id,
             sender: self.sender.clone(),
@@ -137,21 +150,28 @@ impl<E> DriverContext<E> {
     }
 
     pub(crate) async fn next_event(&mut self) -> E {
-        if let Some(event) = self.ready.pop_front() {
-            return event;
-        }
         loop {
-            if let Ok(event) = self.receiver.try_recv() {
-                return event;
-            }
             let result = tokio::select! {
-                Some(event) = self.receiver.recv() => return event,
+                Some(event) = async {
+                    if let Some(event) = self.ready.pop_front() { Some(event) } else { self.receiver.recv().await }
+                } => return event,
                 result = self.jobs.next(), if !self.jobs.is_empty() => result,
-                result = self.watches.next(), if !self.watches.is_empty() => result,
+                event = self.watches.next(), if !self.watches.is_empty() => {
+                    if let Some(event) = event { return event; }
+                    continue;
+                },
             };
             if let Some(event) = result {
                 // Put completion after any progress published while polling the job.
                 self.emit(event);
+                if let Some(older) = self.ready.pop_front() {
+                    return older;
+                }
+                return self
+                    .receiver
+                    .recv()
+                    .await
+                    .expect("the driver context holds a sender");
             }
         }
     }
@@ -217,6 +237,19 @@ mod tests {
         };
         assert_eq!(cx.next_event().await, Event::Progress(id));
         assert_eq!(cx.next_event().await, Event::Done(id));
+    }
+
+    #[tokio::test]
+    async fn a_busy_event_queue_allows_one_shot_work_to_progress() {
+        let mut cx = DriverContext::new();
+        cx.submit(async { Event::Done(RequestId::new(0)) });
+        for _ in 0..1024 {
+            cx.emit(Event::Other);
+            if matches!(cx.next_event().await, Event::Done(_)) {
+                return;
+            }
+        }
+        panic!("the synchronous producer starved the submitted job");
     }
 
     #[tokio::test]

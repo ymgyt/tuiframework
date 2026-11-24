@@ -1,13 +1,22 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use super::{Binding, KeyStroke, KeymapError};
 
 /// Compiled bindings for one layer. Help retains declaration order, including aliases.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LayerKeymap<C> {
     root: Node,
     pub(super) bindings: Vec<Binding<C>>,
-    pub(super) input_chars: Option<fn(char) -> C>,
+    input_chars: Option<Arc<dyn Fn(char) -> C + Send + Sync>>,
+}
+
+impl<C: fmt::Debug> fmt::Debug for LayerKeymap<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LayerKeymap")
+            .field("bindings", &self.bindings)
+            .field("accepts_text", &self.input_chars.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,18 +61,20 @@ impl<C> LayerKeymap<C> {
         Ok(())
     }
 
-    /// Lets a prompt turn typed characters into commands. Modified shortcuts and
-    /// non-character keys still use the regular bindings.
-    pub fn bind_input_chars(&mut self, command: fn(char) -> C) {
-        self.input_chars = Some(command);
+    /// Maps a typed character left over after checking this layer's explicit keys
+    /// and prefixes. A fallback in a higher layer still shadows lower bindings.
+    pub fn bind_input_chars(&mut self, command: impl Fn(char) -> C + Send + Sync + 'static) {
+        self.input_chars = Some(Arc::new(command));
     }
 
-    pub(super) fn takes_text(&self, key: KeyStroke) -> bool {
-        self.input_chars.is_some() && key.as_char().is_some()
+    pub(super) fn input_char(&self, key: KeyStroke) -> Option<C> {
+        let ch = key.as_char()?;
+        self.input_chars.as_ref().map(|command| command(ch))
     }
 
     pub(super) fn takes_first(&self, key: KeyStroke) -> bool {
-        self.takes_text(key) || self.root.children.contains_key(&key)
+        self.root.children.contains_key(&key)
+            || self.input_chars.is_some() && key.as_char().is_some()
     }
 
     pub(super) fn lookup(&self, keys: &[KeyStroke]) -> Lookup<'_, C> {

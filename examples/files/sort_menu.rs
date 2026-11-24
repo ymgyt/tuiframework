@@ -68,10 +68,10 @@ impl Component<Files> for SortMenu {
             .block(
                 Block::bordered()
                     .title("Sort files")
-                    .style(cx.components.theme.base),
+                    .style(cx.theme.common.base),
             )
             .highlight_symbol("> ")
-            .highlight_style(cx.components.theme.selected);
+            .highlight_style(cx.theme.common.selected);
         frame.render_widget(Clear, area);
         frame.render_stateful_widget(
             list,

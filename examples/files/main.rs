@@ -3,7 +3,9 @@ use std::{env, error::Error, io, path::PathBuf, sync::Arc};
 use serde::Deserialize;
 use tuiframework::{
     AppKeymap, Application, Component, Components, Driver, DriverContext, Effects,
-    keymap::KeymapConfig, theme::Theme,
+    keymap::KeymapConfig,
+    ratatui::style::Style,
+    theme::{Palette, Styles},
 };
 
 mod listing;
@@ -40,6 +42,7 @@ enum Command {
     OpenSort,
     Close,
     Choose,
+    ToggleTheme,
 }
 
 enum Event {
@@ -51,47 +54,80 @@ enum Operation {
     ReadDirectory(PathBuf),
 }
 
+/// The file browser uses a separate style for a directory read in progress.
+struct FileTheme {
+    common: Styles,
+    loading: Style,
+}
+
+impl From<Palette> for FileTheme {
+    fn from(palette: Palette) -> Self {
+        let common = Styles::from(palette);
+        Self {
+            loading: common.base.fg(palette.accent),
+            common,
+        }
+    }
+}
+
 /// Both components keep their own selection when the sort menu opens.
 struct Files {
     listing: Listing,
     sort: SortMenu,
-    theme: Theme,
+    theme: FileTheme,
 }
 
 impl Files {
-    fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf, theme: FileTheme) -> Self {
         Self {
             listing: Listing::new(path),
             sort: SortMenu::default(),
-            theme: Theme::default(),
+            theme,
         }
     }
 }
 
 impl Components for Files {
     type Command = Command;
-    type Binding = Command;
+    type Keymap = AppKeymap<Self>;
     type Event = Event;
     type Operation = Operation;
+    type Theme = FileTheme;
+    fn theme(&self) -> &FileTheme {
+        &self.theme
+    }
     type View<'a> = tuiframework::RenderContext<'a, Self>;
     type Layer = Layer;
     type Id = Id;
-    fn ids() -> impl IntoIterator<Item = Id> {
+    fn ids(&self) -> impl IntoIterator<Item = Id> {
         [Id::Files, Id::Sort]
     }
 
-    fn component(&self, id: Id) -> &dyn Component<Self> {
-        match id {
+    fn component(&self, id: Id) -> Option<&dyn Component<Self>> {
+        Some(match id {
             Id::Files => &self.listing,
             Id::Sort => &self.sort,
-        }
+        })
     }
 
-    fn component_mut(&mut self, id: Id) -> &mut dyn Component<Self> {
-        match id {
+    fn component_mut(&mut self, id: Id) -> Option<&mut dyn Component<Self>> {
+        Some(match id {
             Id::Files => &mut self.listing,
             Id::Sort => &mut self.sort,
+        })
+    }
+
+    fn command(&mut self, to: Id, command: Command) -> Effects<Self> {
+        if let Command::ToggleTheme = command {
+            self.theme = if self.theme.common.palette == Palette::dracula() {
+                Palette::ferra().into()
+            } else {
+                Palette::dracula().into()
+            };
+            return Effects::NONE;
         }
+        self.component_mut(to)
+            .map_or(Effects::NONE, |component| component.command(command))
     }
 
     fn visible(&self) -> impl IntoIterator<Item = Id> {
@@ -144,7 +180,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()
         .nth(1)
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    Application::new(Files::new(path), FileSystem, keymap()?)
+    Application::builder()
+        .components(Files::new(path, Palette::default().into()))
+        .driver(FileSystem)
+        .keymap(keymap()?)
+        .build()
         .run()
         .await?;
     Ok(())

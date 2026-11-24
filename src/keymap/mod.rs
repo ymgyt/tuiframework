@@ -9,6 +9,8 @@ use std::{collections::HashMap, hash::Hash};
 
 use thiserror::Error;
 
+use crate::{Components, KeyAction};
+
 pub use config::{Binding, KeymapConfig};
 pub use key::{KeySequence, KeyStroke};
 use layers::LayerOwner;
@@ -28,10 +30,33 @@ pub enum KeymapError {
     Ambiguous(KeySequence),
 }
 
+/// An application's compiled bindings. The compositor supplies the active layers
+/// and delivers a match to the component that owns its layer.
+pub trait KeyBindings<A: Components> {
+    type Action: KeyAction<A>;
+
+    fn binding(
+        &mut self,
+        layers: &LayerStack<A::Layer, A::Id>,
+        key: KeyStroke,
+    ) -> Option<(A::Layer, Self::Action)>;
+
+    /// Discards an unfinished sequence, for example when terminal focus is lost.
+    fn cancel_pending(&mut self) {}
+
+    /// Invalidates any sequence that no longer belongs to the active layers.
+    fn sync_layers(&mut self, _layers: &LayerStack<A::Layer, A::Id>) {}
+}
+
 /// The result of a key press in the current set of layers.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Resolution<I, C> {
-    Matched { owner: I, command: C },
+pub enum Resolution<L, I, C> {
+    /// The winning layer, its frontmost component, and the bound command.
+    Matched {
+        layer: L,
+        owner: I,
+        command: C,
+    },
     Pending,
     Cancelled,
     Masked,
@@ -134,6 +159,13 @@ impl<L: Copy + Eq + Hash, C: Clone, I: Copy + Eq> Keymap<L, C, I> {
         })
     }
 
+    /// The topmost layer that reserves a first key, including prefixes, text
+    /// fallbacks, and keys masked by a popup. Use `stack.owner(layer)` to check
+    /// whether a command from that layer can be delivered.
+    pub fn layer_for(&self, stack: &LayerStack<L, I>, key: KeyStroke) -> Option<L> {
+        self.first(stack, key).map(|entry| entry.layer)
+    }
+
     pub fn sync_layers(&mut self, stack: &LayerStack<L, I>) {
         if self.active_prefix(stack).is_none() {
             self.pending = None;
@@ -157,7 +189,7 @@ impl<L: Copy + Eq + Hash, C: Clone, I: Copy + Eq> Keymap<L, C, I> {
         self.pending = None;
     }
 
-    pub fn resolve(&mut self, stack: &LayerStack<L, I>, key: KeyStroke) -> Resolution<I, C> {
+    pub fn resolve(&mut self, stack: &LayerStack<L, I>, key: KeyStroke) -> Resolution<L, I, C> {
         self.sync_layers(stack);
         let mut pending = self.pending.take();
         let keys = match &mut pending {
@@ -173,24 +205,24 @@ impl<L: Copy + Eq + Hash, C: Clone, I: Copy + Eq> Keymap<L, C, I> {
         let map = self
             .map(entry.layer)
             .expect("the selected layer has bindings");
-        if keys.len() == 1
-            && let (Some(text), Some(ch)) = (map.input_chars, key.as_char())
-        {
-            return if entry.covered {
-                Resolution::Masked
-            } else {
-                Resolution::Matched {
-                    owner: entry.owner,
-                    command: text(ch),
-                }
-            };
-        }
         match map.lookup(keys) {
             Lookup::Match(_) if entry.covered => Resolution::Masked,
             Lookup::Match(command) => Resolution::Matched {
+                layer: entry.layer,
                 owner: entry.owner,
                 command: command.clone(),
             },
+            // The layer was chosen because it takes the first key. If that
+            // single key has no explicit binding, the text fallback owns it.
+            Lookup::Missing if keys.len() == 1 && entry.covered => Resolution::Masked,
+            Lookup::Missing if keys.len() == 1 => {
+                map.input_char(key)
+                    .map_or(Resolution::Cancelled, |command| Resolution::Matched {
+                        layer: entry.layer,
+                        owner: entry.owner,
+                        command,
+                    })
+            }
             Lookup::Missing => Resolution::Cancelled,
             Lookup::Prefix => {
                 self.pending = Some(pending.unwrap_or_else(|| Pending {
@@ -217,11 +249,7 @@ impl<L: Copy + Eq + Hash, C: Clone, I: Copy + Eq> Keymap<L, C, I> {
             for binding in &map.bindings {
                 let keys = binding.on.as_slice();
                 let first = keys[0];
-                if map.takes_text(first)
-                    || self
-                        .first(stack, first)
-                        .is_none_or(|e| e.layer != entry.layer)
-                {
+                if self.layer_for(stack, first) != Some(entry.layer) {
                     continue;
                 }
                 let Some(suffix) = keys.strip_prefix(pending_keys) else {
@@ -240,5 +268,28 @@ impl<L: Copy + Eq + Hash, C: Clone, I: Copy + Eq> Keymap<L, C, I> {
             }
         }
         hints
+    }
+}
+
+impl<A: Components, B: Clone + KeyAction<A>> KeyBindings<A> for Keymap<A::Layer, B, A::Id> {
+    type Action = B;
+
+    fn binding(
+        &mut self,
+        layers: &LayerStack<A::Layer, A::Id>,
+        key: KeyStroke,
+    ) -> Option<(A::Layer, B)> {
+        match self.resolve(layers, key) {
+            Resolution::Matched { layer, command, .. } => Some((layer, command)),
+            _ => None,
+        }
+    }
+
+    fn cancel_pending(&mut self) {
+        self.cancel_pending();
+    }
+
+    fn sync_layers(&mut self, layers: &LayerStack<A::Layer, A::Id>) {
+        self.sync_layers(layers);
     }
 }

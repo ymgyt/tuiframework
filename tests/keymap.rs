@@ -80,6 +80,7 @@ fn configured_alias_precedes_defaults_even_when_a_sibling_shares_the_first_key()
     assert_eq!(
         map.resolve(&layers, key("n")),
         Resolution::Matched {
+            layer: Layer::Files,
             owner: 1,
             command: Command::Filter
         }
@@ -98,7 +99,11 @@ fn local_prefix_inherits_siblings_and_a_change_of_owner_cancels_it() {
         assert_eq!(map.resolve(&layers, key("g")), Resolution::Pending);
         assert_eq!(
             map.resolve(&layers, key(last)),
-            Resolution::Matched { owner: 1, command }
+            Resolution::Matched {
+                layer: Layer::Files,
+                owner: 1,
+                command
+            }
         );
     }
     assert_eq!(map.resolve(&layers, key("g")), Resolution::Pending);
@@ -131,6 +136,7 @@ fn masked_layers_consume_keys_and_runtime_text_layers_shadow_the_background() {
     assert_eq!(
         map.resolve(&layers, key("e")),
         Resolution::Matched {
+            layer: Layer::Prompt,
             owner: 2,
             command: Command::Text('e')
         }
@@ -138,6 +144,7 @@ fn masked_layers_consume_keys_and_runtime_text_layers_shadow_the_background() {
     assert_eq!(
         map.resolve(&layers, key("C-c")),
         Resolution::Matched {
+            layer: Layer::Prompt,
             owner: 2,
             command: Command::Quit
         }
@@ -146,6 +153,60 @@ fn masked_layers_consume_keys_and_runtime_text_layers_shadow_the_background() {
     layers.truncate_after(Layer::Global);
     assert_eq!(layers.top(), Some(Layer::Global));
     assert_eq!(map.resolve(&layers, key("g")), Resolution::Unbound);
+}
+
+#[test]
+fn explicit_keys_and_prefixes_win_over_a_text_fallback_in_their_layer() {
+    let mut map = Map::compile(toml::from_str(DEFAULTS).unwrap()).unwrap();
+    let mut layers = LayerStack::default();
+    layers.extend(1, &[Layer::Global, Layer::List]);
+    layers.extend(2, &[Layer::Prompt]);
+    let mut prompt = LayerKeymap::default();
+    let marker = '#';
+    prompt.bind_input_chars(move |ch| Command::Text(if ch == ' ' { marker } else { ch }));
+    prompt.bind(binding("1", Command::Open)).unwrap();
+    prompt.bind(binding("g g", Command::First)).unwrap();
+    map.set_layer(Layer::Prompt, prompt);
+
+    assert_eq!(
+        map.hints(&layers)
+            .iter()
+            .map(|hint| hint.keys.as_str())
+            .collect::<Vec<_>>(),
+        ["1", "g g"]
+    );
+    assert_eq!(map.layer_for(&layers, key("q")), Some(Layer::Prompt));
+    assert_eq!(map.resolve(&layers, key("g")), Resolution::Pending);
+    assert_eq!(map.hints(&layers)[0].keys, "g");
+    assert_eq!(
+        map.resolve(&layers, key("g")),
+        Resolution::Matched {
+            layer: Layer::Prompt,
+            owner: 2,
+            command: Command::First
+        }
+    );
+    assert_eq!(map.resolve(&layers, key("g")), Resolution::Pending);
+    assert_eq!(map.resolve(&layers, key("x")), Resolution::Cancelled);
+    for (stroke, command) in [
+        ("1", Command::Open),
+        ("space", Command::Text('#')),
+        ("q", Command::Text('q')),
+    ] {
+        assert_eq!(
+            map.resolve(&layers, key(stroke)),
+            Resolution::Matched {
+                layer: Layer::Prompt,
+                owner: 2,
+                command
+            }
+        );
+    }
+    layers.cover(&[Layer::Prompt]);
+    assert_eq!(map.layer_for(&layers, key("1")), Some(Layer::Prompt));
+    assert_eq!(layers.owner(Layer::Prompt), None);
+    assert!(map.hints(&layers).is_empty());
+    assert_eq!(map.resolve(&layers, key("q")), Resolution::Masked);
 }
 
 #[test]
