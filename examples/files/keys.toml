@@ -1,0 +1,21 @@
+[global]
+keymap = [{ on = "q", command = "quit", desc = "quit" }]
+
+[list]
+keymap = [
+    { on = "j", command = "next", desc = "next" },
+    { on = "k", command = "previous", desc = "previous" },
+    { on = ["g", "g"], command = "first", desc = "first" },
+]
+
+[files]
+keymap = [
+    { on = "r", command = "reload", desc = "reload" },
+    { on = "s", command = "open-sort", desc = "sort" },
+]
+
+[sort]
+keymap = [
+    { on = "enter", command = "choose", desc = "apply" },
+    { on = "esc", command = "close", desc = "cancel" },
+]

@@ -1,0 +1,37 @@
+[package]
+name = "tuiframework"
+version = "0.1.0"
+description = "An event-driven application loop, drivers, and layered keymaps for Ratatui"
+edition = "2024"
+authors = ["ymgyt"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ymgyt/tuiframework"
+keywords = ["tui", "ratatui", "keymap"]
+categories = ["command-line-interface", "asynchronous"]
+
+[dependencies]
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+indexmap = { version = "2", features = ["serde"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "underline-color", "layout-cache"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "fs", "test-util"] }
+toml = "1"
+
+[[example]]
+name = "files"
+test = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
