@@ -9,6 +9,9 @@ repository = "https://github.com/ymgyt/tuiframework"
 keywords = ["tui", "ratatui", "keymap"]
 categories = ["command-line-interface", "asynchronous"]
 
+[features]
+unstable-rendered-line-info = ["ratatui/unstable-rendered-line-info"]
+
 [dependencies]
 bon = "3.10"
 crossterm = { version = "0.29", features = ["event-stream"] }
