@@ -9,7 +9,7 @@ use std::{collections::HashMap, hash::Hash};
 
 use thiserror::Error;
 
-use crate::{Components, KeyAction};
+use crate::Ui;
 
 pub use config::{Binding, KeymapConfig};
 pub use key::{KeySequence, KeyStroke};
@@ -17,6 +17,21 @@ use layers::LayerOwner;
 pub use layers::LayerStack;
 pub use trie::LayerKeymap;
 use trie::Lookup;
+
+/// Keymap built from the command, layer, and component types of a UI.
+pub type UiKeymap<U, B = <U as Ui>::Command> = Keymap<<U as Ui>::Layer, B, <U as Ui>::Id>;
+
+/// Resolves a binding to its destination and command once the active layer's
+/// owner is known. Binding a command directly sends it to that owner.
+pub trait KeyAction<U: Ui> {
+    fn command_for(self, owner: U::Id) -> (U::Id, U::Command);
+}
+
+impl<U: Ui> KeyAction<U> for U::Command {
+    fn command_for(self, owner: U::Id) -> (U::Id, U::Command) {
+        (owner, self)
+    }
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum KeymapError {
@@ -32,20 +47,19 @@ pub enum KeymapError {
 
 /// An application's compiled bindings. The compositor supplies the active layers
 /// and delivers a match to the component that owns its layer.
-pub trait KeyBindings<A: Components> {
-    type Action: KeyAction<A>;
-
-    fn binding(
+pub trait KeyBindings<U: Ui> {
+    /// Resolves one key to its destination and domain command.
+    fn resolve_command(
         &mut self,
-        layers: &LayerStack<A::Layer, A::Id>,
+        layers: &LayerStack<U::Layer, U::Id>,
         key: KeyStroke,
-    ) -> Option<(A::Layer, Self::Action)>;
+    ) -> Option<(U::Id, U::Command)>;
 
     /// Discards an unfinished sequence, for example when terminal focus is lost.
     fn cancel_pending(&mut self) {}
 
     /// Invalidates any sequence that no longer belongs to the active layers.
-    fn sync_layers(&mut self, _layers: &LayerStack<A::Layer, A::Id>) {}
+    fn sync_layers(&mut self, _layers: &LayerStack<U::Layer, U::Id>) {}
 }
 
 /// The result of a key press in the current set of layers.
@@ -271,16 +285,14 @@ impl<L: Copy + Eq + Hash, C: Clone, I: Copy + Eq> Keymap<L, C, I> {
     }
 }
 
-impl<A: Components, B: Clone + KeyAction<A>> KeyBindings<A> for Keymap<A::Layer, B, A::Id> {
-    type Action = B;
-
-    fn binding(
+impl<U: Ui, B: Clone + KeyAction<U>> KeyBindings<U> for Keymap<U::Layer, B, U::Id> {
+    fn resolve_command(
         &mut self,
-        layers: &LayerStack<A::Layer, A::Id>,
+        layers: &LayerStack<U::Layer, U::Id>,
         key: KeyStroke,
-    ) -> Option<(A::Layer, B)> {
+    ) -> Option<(U::Id, U::Command)> {
         match self.resolve(layers, key) {
-            Resolution::Matched { layer, command, .. } => Some((layer, command)),
+            Resolution::Matched { owner, command, .. } => Some(command.command_for(owner)),
             _ => None,
         }
     }
@@ -289,7 +301,7 @@ impl<A: Components, B: Clone + KeyAction<A>> KeyBindings<A> for Keymap<A::Layer,
         self.cancel_pending();
     }
 
-    fn sync_layers(&mut self, layers: &LayerStack<A::Layer, A::Id>) {
+    fn sync_layers(&mut self, layers: &LayerStack<U::Layer, U::Id>) {
         self.sync_layers(layers);
     }
 }

@@ -33,7 +33,7 @@ impl Component<Files> for SortMenu {
         layers.cover(&[Layer::Files]);
     }
 
-    fn command(&mut self, command: Command) -> Effects<Files> {
+    fn apply_command(&mut self, command: Command) -> Effects<Files> {
         match command {
             Command::OpenSort => {
                 self.selected = self.applied;

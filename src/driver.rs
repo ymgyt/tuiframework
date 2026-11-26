@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::Components;
+use crate::event_loop::Redraw;
 use futures_util::{
     FutureExt as _, Stream, StreamExt as _,
     future::{AbortHandle, BoxFuture},
@@ -21,16 +21,36 @@ pub enum DriverMessage<E, O> {
 
 /// Interprets the operations produced by a compositor. A driver can own API
 /// clients, caches and other application-specific resources.
-pub trait Driver<A: Components> {
+pub trait Driver {
+    type Event;
+    type Operation;
+
     /// Stops resources owned by the driver when the application finishes.
     fn shutdown(&mut self) {}
 
-    fn dispatch(&mut self, operation: A::Operation, cx: &mut DriverContext<A::Event>);
+    fn dispatch(&mut self, operation: Self::Operation, cx: &mut DriverContext<Self::Event>);
 
     /// Polls sources owned by this driver, such as a credential renewal timer.
     /// Return pending until a source has work and arrange to wake the task.
-    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<DriverMessage<A::Event, A::Operation>> {
+    fn poll(&mut self, _cx: &mut Context<'_>) -> Poll<DriverMessage<Self::Event, Self::Operation>> {
         Poll::Pending
+    }
+}
+
+impl<D: Driver> Driver for &mut D {
+    type Event = D::Event;
+    type Operation = D::Operation;
+
+    fn dispatch(&mut self, operation: D::Operation, cx: &mut DriverContext<'_, D::Event>) {
+        (**self).dispatch(operation, cx);
+    }
+
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<DriverMessage<D::Event, D::Operation>> {
+        (**self).poll(cx)
+    }
+
+    fn shutdown(&mut self) {
+        (**self).shutdown();
     }
 }
 
@@ -72,17 +92,16 @@ impl<E> RequestContext<E> {
 }
 
 /// Owns the event queue and concurrently polled futures and streams of one run.
-pub struct DriverContext<E> {
+pub(crate) struct DriverEvents<E> {
     jobs: FuturesUnordered<BoxFuture<'static, E>>,
     watches: SelectAll<BoxStream<'static, E>>,
     ready: VecDeque<E>,
     sender: mpsc::UnboundedSender<E>,
     receiver: mpsc::UnboundedReceiver<E>,
     next_request_id: u64,
-    redraw: bool,
 }
 
-impl<E> DriverContext<E> {
+impl<E> DriverEvents<E> {
     pub(crate) fn new() -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
@@ -92,18 +111,58 @@ impl<E> DriverContext<E> {
             sender,
             receiver,
             next_request_id: 0,
-            redraw: false,
         }
     }
 
+    pub(crate) fn has_pending_work(&self) -> bool {
+        !self.jobs.is_empty() || !self.ready.is_empty() || !self.receiver.is_empty()
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.receiver.close();
+        self.jobs.clear();
+        self.watches.clear();
+        self.ready.clear();
+        while self.receiver.try_recv().is_ok() {}
+    }
+
+    pub(crate) async fn next_event(&mut self) -> E {
+        loop {
+            tokio::select! {
+                Some(event) = async {
+                    match self.ready.pop_front() {
+                        Some(event) => Some(event),
+                        None => self.receiver.recv().await,
+                    }
+                } => return event,
+                Some(completed) = self.jobs.next(), if !self.jobs.is_empty() => {
+                    // Progress emitted by the job is already queued before its completion.
+                    let _ = self.sender.send(completed);
+                }
+                Some(event) = self.watches.next(), if !self.watches.is_empty() => return event,
+            }
+        }
+    }
+}
+
+/// Capabilities lent to one driver dispatch. Submitted work belongs to the event loop.
+pub struct DriverContext<'a, E> {
+    events: &'a mut DriverEvents<E>,
+    redraw: &'a mut Redraw,
+}
+
+impl<'a, E> DriverContext<'a, E> {
+    pub(crate) fn new(events: &'a mut DriverEvents<E>, redraw: &'a mut Redraw) -> Self {
+        Self { events, redraw }
+    }
     /// Queues a result from a synchronous operation.
     pub fn emit(&self, event: E) {
-        let _ = self.sender.send(event);
+        let _ = self.events.sender.send(event);
     }
 
     /// Schedules an independent operation and delivers its result to the UI.
     pub fn submit(&mut self, future: impl Future<Output = E> + Send + 'static) {
-        self.jobs.push(future.boxed());
+        self.events.jobs.push(future.boxed());
     }
 
     /// Queues a start event and schedules the matching completion. The future
@@ -112,68 +171,35 @@ impl<E> DriverContext<E> {
     where
         F: Future<Output = E> + Send + 'static,
     {
-        let id = RequestId(self.next_request_id);
-        self.next_request_id = self
+        let id = RequestId(self.events.next_request_id);
+        self.events.next_request_id = self
+            .events
             .next_request_id
             .checked_add(1)
             .expect("request IDs exhausted");
         // Reserve the start event's place ahead of any progress emitted by build.
-        let queued = self.receiver.len();
-        self.ready
-            .extend((0..queued).filter_map(|_| self.receiver.try_recv().ok()));
+        let queued = self.events.receiver.len();
+        self.events
+            .ready
+            .extend((0..queued).filter_map(|_| self.events.receiver.try_recv().ok()));
         let (started, future) = build(RequestContext {
             id,
-            sender: self.sender.clone(),
+            sender: self.events.sender.clone(),
         });
-        self.ready.push_back(started);
+        self.events.ready.push_back(started);
         self.submit(future);
     }
 
     /// Subscribes to an event stream. Use the handle to stop a watch early.
     pub fn watch(&mut self, events: impl Stream<Item = E> + Send + 'static) -> AbortHandle {
         let (events, handle) = stream::abortable(events);
-        self.watches.push(events.boxed());
+        self.events.watches.push(events.boxed());
         handle
     }
 
     /// Repaints the entire fullscreen terminal after an external program has used it.
     pub fn force_redraw(&mut self) {
-        self.redraw = true;
-    }
-
-    pub(crate) fn take_redraw_request(&mut self) -> bool {
-        std::mem::take(&mut self.redraw)
-    }
-
-    pub(crate) fn has_pending_work(&self) -> bool {
-        !self.jobs.is_empty() || !self.ready.is_empty() || !self.receiver.is_empty()
-    }
-
-    pub(crate) async fn next_event(&mut self) -> E {
-        loop {
-            let result = tokio::select! {
-                Some(event) = async {
-                    if let Some(event) = self.ready.pop_front() { Some(event) } else { self.receiver.recv().await }
-                } => return event,
-                result = self.jobs.next(), if !self.jobs.is_empty() => result,
-                event = self.watches.next(), if !self.watches.is_empty() => {
-                    if let Some(event) = event { return event; }
-                    continue;
-                },
-            };
-            if let Some(event) = result {
-                // Put completion after any progress published while polling the job.
-                self.emit(event);
-                if let Some(older) = self.ready.pop_front() {
-                    return older;
-                }
-                return self
-                    .receiver
-                    .recv()
-                    .await
-                    .expect("the driver context holds a sender");
-            }
-        }
+        *self.redraw = Redraw::Full;
     }
 }
 
@@ -193,9 +219,10 @@ mod tests {
 
     #[tokio::test]
     async fn requests_preserve_progress_order_while_other_work_can_finish() {
-        let mut cx = DriverContext::new();
+        let mut events = DriverEvents::new();
+        let mut redraw = Redraw::Diff;
         let (resume, wait) = oneshot::channel();
-        cx.request(|request| {
+        DriverContext::new(&mut events, &mut redraw).request(|request| {
             let id = request.id();
             (Event::Start(id), async move {
                 wait.await.unwrap();
@@ -203,49 +230,52 @@ mod tests {
                 Event::Done(id)
             })
         });
-        let Event::Start(first) = cx.next_event().await else {
+        let Event::Start(first) = events.next_event().await else {
             panic!("expected request start")
         };
-        cx.request(|request| {
+        DriverContext::new(&mut events, &mut redraw).request(|request| {
             let id = request.id();
             (Event::Start(id), async move { Event::Done(id) })
         });
-        let Event::Start(second) = cx.next_event().await else {
+        let Event::Start(second) = events.next_event().await else {
             panic!("expected second start")
         };
         assert_ne!(first, second);
-        assert_eq!(cx.next_event().await, Event::Done(second));
+        assert_eq!(events.next_event().await, Event::Done(second));
         resume.send(()).unwrap();
-        assert_eq!(cx.next_event().await, Event::Progress(first));
-        assert_eq!(cx.next_event().await, Event::Done(first));
-        assert!(cx.next_event().now_or_never().is_none());
+        assert_eq!(events.next_event().await, Event::Progress(first));
+        assert_eq!(events.next_event().await, Event::Done(first));
+        assert!(events.next_event().now_or_never().is_none());
     }
 
     #[tokio::test]
     async fn progress_emitted_while_building_a_request_follows_its_start() {
-        let mut cx = DriverContext::new();
-        cx.emit(Event::Other);
-        cx.request(|request| {
+        let mut events = DriverEvents::new();
+        let mut redraw = Redraw::Diff;
+        DriverContext::new(&mut events, &mut redraw).emit(Event::Other);
+        DriverContext::new(&mut events, &mut redraw).request(|request| {
             request.emit(Event::Progress).unwrap();
             (Event::Start(request.id()), async move {
                 Event::Done(request.id())
             })
         });
-        assert_eq!(cx.next_event().await, Event::Other);
-        let Event::Start(id) = cx.next_event().await else {
+        assert_eq!(events.next_event().await, Event::Other);
+        let Event::Start(id) = events.next_event().await else {
             panic!("expected request start")
         };
-        assert_eq!(cx.next_event().await, Event::Progress(id));
-        assert_eq!(cx.next_event().await, Event::Done(id));
+        assert_eq!(events.next_event().await, Event::Progress(id));
+        assert_eq!(events.next_event().await, Event::Done(id));
     }
 
     #[tokio::test]
     async fn a_busy_event_queue_allows_one_shot_work_to_progress() {
-        let mut cx = DriverContext::new();
-        cx.submit(async { Event::Done(RequestId::new(0)) });
+        let mut events = DriverEvents::new();
+        let mut redraw = Redraw::Diff;
+        DriverContext::new(&mut events, &mut redraw)
+            .submit(async { Event::Done(RequestId::new(0)) });
         for _ in 0..1024 {
-            cx.emit(Event::Other);
-            if matches!(cx.next_event().await, Event::Done(_)) {
+            DriverContext::new(&mut events, &mut redraw).emit(Event::Other);
+            if matches!(events.next_event().await, Event::Done(_)) {
                 return;
             }
         }
@@ -254,12 +284,14 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_watch_leaves_the_queue_usable() {
-        let mut cx = DriverContext::new();
-        let watch = cx.watch(stream::repeat_with(|| Event::Other));
-        assert_eq!(cx.next_event().await, Event::Other);
+        let mut events = DriverEvents::new();
+        let mut redraw = Redraw::Diff;
+        let watch = DriverContext::new(&mut events, &mut redraw)
+            .watch(stream::repeat_with(|| Event::Other));
+        assert_eq!(events.next_event().await, Event::Other);
         watch.abort();
-        assert!(cx.next_event().now_or_never().is_none());
-        cx.submit(async { Event::Other });
-        assert_eq!(cx.next_event().await, Event::Other);
+        assert!(events.next_event().now_or_never().is_none());
+        DriverContext::new(&mut events, &mut redraw).submit(async { Event::Other });
+        assert_eq!(events.next_event().await, Event::Other);
     }
 }

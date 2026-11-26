@@ -49,7 +49,7 @@ impl Component<Files> for Listing {
         &[Layer::Global, Layer::List, Layer::Files]
     }
 
-    fn command(&mut self, command: Command) -> Effects<Files> {
+    fn apply_command(&mut self, command: Command) -> Effects<Files> {
         match command {
             Command::Next => {
                 self.selected = (self.selected + 1).min(self.names.len().saturating_sub(1));
@@ -72,7 +72,7 @@ impl Component<Files> for Listing {
         true
     }
 
-    fn on_event(&mut self, event: &Event) -> Effects<Files> {
+    fn apply_event(&mut self, event: &Event) -> Effects<Files> {
         match event {
             Event::Loaded(result) => {
                 self.loading = false;

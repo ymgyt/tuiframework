@@ -1,119 +1,39 @@
-use std::hash::Hash;
-
-use crossterm::event::Event as TerminalEvent;
 use ratatui::{Frame, layout::Rect};
 
-use crate::keymap::{KeyBindings, Keymap, LayerStack};
-
-/// Keymap built from the command, layer, and component types of one application.
-pub type AppKeymap<A, B = <A as Components>::Command> =
-    Keymap<<A as Components>::Layer, B, <A as Components>::Id>;
-
-/// Resolves a binding to its destination and command once the active layer's
-/// owner is known. Binding a command directly sends it to that owner.
-pub trait KeyAction<A: Components> {
-    fn command_for(self, owner: A::Id) -> (A::Id, A::Command);
-}
-
-impl<A: Components> KeyAction<A> for A::Command {
-    fn command_for(self, owner: A::Id) -> (A::Id, A::Command) {
-        (owner, self)
-    }
-}
-
-/// The app's vocabulary and concrete component store. An ID may address a
-/// nested field of another component.
-pub trait Components: Sized {
-    /// A stable address. A dynamic store should assign a fresh ID if an old
-    /// component's queued commands could outlive it.
-    type Id: Copy + Eq;
-    type Layer: Copy + Eq + Hash;
-    type Command;
-    /// The compiled keymap shared by input dispatch and the render context.
-    type Keymap: KeyBindings<Self>;
-    type Event;
-    type Operation;
-    /// The application owns its current theme and may change it between frames.
-    type Theme: ?Sized;
-    fn theme(&self) -> &Self::Theme;
-    /// Data shared by every component in one draw. Use `RenderContext<'a, Self>`
-    /// directly or convert it into a view with a shared, app-specific layout.
-    type View<'a>: From<RenderContext<'a, Self>>
-    where
-        Self: 'a;
-
-    /// Every currently registered ID once, in event delivery order, including
-    /// hidden components. Each published event takes its own snapshot.
-    fn ids(&self) -> impl IntoIterator<Item = Self::Id>;
-
-    /// Looks up a component by ID. A dynamic store returns `None` for a
-    /// component that has closed since the ID was captured.
-    fn component(&self, id: Self::Id) -> Option<&dyn Component<Self>>;
-    fn component_mut(&mut self, id: Self::Id) -> Option<&mut dyn Component<Self>>;
-
-    /// Handles an addressed command. Override this to route a domain command
-    /// using sibling state, for example a filter command for the selected tab.
-    fn command(&mut self, to: Self::Id, command: Self::Command) -> Effects<Self> {
-        self.component_mut(to)
-            .map_or(Effects::NONE, |component| component.command(command))
-    }
-
-    /// Visible component IDs, from the back of the screen to the front.
-    fn visible(&self) -> impl IntoIterator<Item = Self::Id>;
-
-    fn start(&mut self) -> Effects<Self> {
-        Effects::NONE
-    }
-
-    /// Observes terminal input before its bound command is delivered. The
-    /// binding is resolved against the layers of the frame the user saw.
-    fn on_input(&mut self, _input: &TerminalEvent) -> Effects<Self> {
-        Effects::NONE
-    }
-
-    /// Install or reset runtime layers here when their backing data changes.
-    fn update_keymap(&mut self, _keymap: &mut Self::Keymap) {}
-
-    /// Enables timer wakeups while an animation is active.
-    fn is_busy(&self) -> bool {
-        false
-    }
-
-    fn tick(&mut self) {}
-}
+use crate::{TerminalFocus, Ui, keymap::LayerStack};
 
 /// One addressable part of an application. State changes stay with its owner.
-pub trait Component<A: Components> {
-    fn render(&self, frame: &mut Frame<'_>, cx: &A::View<'_>);
+pub trait Component<U: Ui> {
+    fn render(&self, frame: &mut Frame<'_>, cx: &U::Context<'_>);
 
-    fn key_layers(&self) -> &[A::Layer] {
+    fn key_layers(&self) -> &[U::Layer] {
         &[]
     }
 
-    fn mask_lower_layers(&self, _layers: &mut LayerStack<A::Layer, A::Id>) {}
+    fn mask_lower_layers(&self, _layers: &mut LayerStack<U::Layer, U::Id>) {}
 
-    fn command(&mut self, _command: A::Command) -> Effects<A> {
+    fn apply_command(&mut self, _command: U::Command) -> Effects<U> {
         Effects::NONE
     }
 
     /// Checked in registration order for each published event, including while hidden.
-    fn subscribes(&self, _event: &A::Event) -> bool {
+    fn subscribes(&self, _event: &U::Event) -> bool {
         false
     }
 
-    fn on_event(&mut self, _event: &A::Event) -> Effects<A> {
+    fn apply_event(&mut self, _event: &U::Event) -> Effects<U> {
         Effects::NONE
     }
 }
 
 /// The shared state and resolved input layers for the frame being drawn.
-pub struct RenderContext<'a, A: Components> {
-    pub components: &'a A,
-    pub theme: &'a A::Theme,
+pub struct RenderContext<'a, U: Ui> {
+    pub ui: &'a U,
+    pub theme: &'a U::Theme,
     pub area: Rect,
-    pub focused: bool,
-    pub keymap: &'a A::Keymap,
-    pub layers: &'a LayerStack<A::Layer, A::Id>,
+    pub focus: TerminalFocus,
+    pub keymap: &'a U::Keymap,
+    pub layers: &'a LayerStack<U::Layer, U::Id>,
 }
 
 /// Facts, addressed commands, and external operations produced by one state transition.
@@ -125,14 +45,14 @@ pub struct RenderContext<'a, A: Components> {
 /// Each reply contributes its operations and runs its commands in order. The
 /// driver receives the collected operations after all commands have run.
 #[must_use]
-pub struct Effects<A: Components> {
-    pub(crate) events: Vec<A::Event>,
-    pub(crate) commands: Vec<(A::Id, A::Command)>,
-    pub(crate) operations: Vec<A::Operation>,
+pub struct Effects<U: Ui> {
+    pub(crate) events: Vec<U::Event>,
+    pub(crate) commands: Vec<(U::Id, U::Command)>,
+    pub(crate) operations: Vec<U::Operation>,
     pub(crate) quit: bool,
 }
 
-impl<A: Components> Effects<A> {
+impl<U: Ui> Effects<U> {
     pub const NONE: Self = Self {
         events: Vec::new(),
         commands: Vec::new(),
@@ -141,21 +61,46 @@ impl<A: Components> Effects<A> {
     };
 
     /// Publishes a fact to all interested components.
-    pub fn emit(mut self, event: A::Event) -> Self {
+    pub fn emit(mut self, event: U::Event) -> Self {
         self.events.push(event);
         self
     }
 
     /// Addresses a follow-up command to a component, including one currently hidden.
-    pub fn send(mut self, to: A::Id, command: A::Command) -> Self {
+    pub fn send(mut self, to: U::Id, command: U::Command) -> Self {
         self.commands.push((to, command));
         self
     }
 
+    /// Delivers a batch to the same component in order.
+    pub fn send_all(mut self, to: U::Id, commands: impl IntoIterator<Item = U::Command>) -> Self {
+        self.commands
+            .extend(commands.into_iter().map(|command| (to, command)));
+        self
+    }
+
     /// Requests work from the application's driver.
-    pub fn operation(mut self, operation: A::Operation) -> Self {
+    pub fn operation(mut self, operation: U::Operation) -> Self {
         self.operations.push(operation);
         self
+    }
+
+    /// Collects an ordered batch of work produced by one transition.
+    pub fn from_operations(operations: impl IntoIterator<Item = U::Operation>) -> Self {
+        Self {
+            operations: operations.into_iter().collect(),
+            ..Self::NONE
+        }
+    }
+
+    /// Addressed commands in delivery order.
+    pub fn commands(&self) -> &[(U::Id, U::Command)] {
+        &self.commands
+    }
+
+    /// External operations in dispatch order.
+    pub fn operations(&self) -> &[U::Operation] {
+        &self.operations
     }
 
     pub fn quit(mut self) -> Self {

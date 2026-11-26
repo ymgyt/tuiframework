@@ -1,52 +1,60 @@
+use std::ops::ControlFlow;
+
 use crossterm::event::{Event as TerminalEvent, KeyEventKind};
 use ratatui::Frame;
 
 use crate::{
-    component::{Components, Effects, KeyAction as _, RenderContext},
+    Ui,
+    component::{Effects, RenderContext},
     keymap::{KeyBindings as _, KeyStroke, LayerStack},
 };
 
-/// Routes inputs and facts to the app's components and draws the visible stack.
-pub struct Compositor<A: Components> {
-    pub components: A,
-    keymap: A::Keymap,
-    visible: Vec<A::Id>,
-    layers: LayerStack<A::Layer, A::Id>,
-    focused: bool,
-    pub(crate) quit: bool,
+/// Window focus reported by the terminal and passed to components when rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalFocus {
+    Gained,
+    Lost,
 }
 
-impl<A: Components> Compositor<A> {
-    pub fn new(components: A, keymap: A::Keymap) -> Self {
+/// External operations and loop control produced by a completed UI transition.
+#[derive(Debug)]
+#[must_use]
+pub struct DispatchResult<O> {
+    pub operations: Vec<O>,
+    pub control_flow: ControlFlow<()>,
+}
+
+/// Routes inputs and facts to the app's components and draws the visible stack.
+pub struct Compositor<U: Ui> {
+    pub ui: U,
+    keymap: U::Keymap,
+    visible: Vec<U::Id>,
+    layers: LayerStack<U::Layer, U::Id>,
+    focus: TerminalFocus,
+}
+
+impl<U: Ui> Compositor<U> {
+    pub fn new(ui: U, keymap: U::Keymap) -> Self {
         let mut compositor = Self {
-            components,
+            ui,
             keymap,
             visible: Vec::new(),
             layers: LayerStack::default(),
-            focused: true,
-            quit: false,
+            focus: TerminalFocus::Gained,
         };
         compositor.refresh();
         compositor
     }
 
-    pub(crate) fn start(&mut self) -> Vec<A::Operation> {
-        self.quit = false;
-        self.focused = true;
-        self.keymap.cancel_pending();
-        let effects = self.components.start();
-        self.apply(effects)
-    }
-
     /// Rebuilds the display order and layers after direct changes to app state.
     /// Input and event dispatch already do this after applying their effects.
     pub fn refresh(&mut self) {
-        self.components.update_keymap(&mut self.keymap);
+        self.ui.update_keymap(&mut self.keymap);
         self.visible.clear();
-        self.visible.extend(self.components.visible());
+        self.visible.extend(self.ui.visible());
         self.layers.clear();
         for &id in &self.visible {
-            if let Some(component) = self.components.component(id) {
+            if let Some(component) = self.ui.component(id) {
                 component.mask_lower_layers(&mut self.layers);
                 self.layers.extend(id, component.key_layers());
             }
@@ -55,42 +63,53 @@ impl<A: Components> Compositor<A> {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        let cx = RenderContext {
-            components: &self.components,
-            theme: self.components.theme(),
+        let cx = U::Context::from(RenderContext {
+            ui: &self.ui,
+            theme: self.ui.theme(),
             area: frame.area(),
-            focused: self.focused,
+            focus: self.focus,
             keymap: &self.keymap,
             layers: &self.layers,
-        };
-        let view = A::View::from(cx);
+        });
         for &id in &self.visible {
-            if let Some(component) = self.components.component(id) {
-                component.render(frame, &view);
+            if let Some(component) = self.ui.component(id) {
+                component.render(frame, &cx);
             }
         }
     }
 
-    pub fn resolve_key(&mut self, key: KeyStroke) -> Option<(A::Id, A::Command)> {
-        let (layer, action) = self.keymap.binding(&self.layers, key)?;
-        Some(action.command_for(self.layers.owner(layer)?))
+    /// Resolves a key against the current layers without applying its command.
+    pub fn resolve_key(&mut self, key: KeyStroke) -> Option<(U::Id, U::Command)> {
+        self.keymap.resolve_command(&self.layers, key)
     }
 
-    pub(crate) fn send(&mut self, to: A::Id, command: A::Command) -> Vec<A::Operation> {
+    pub(crate) fn tick(&mut self) {
+        self.ui.tick();
+        self.refresh();
+    }
+
+    pub fn apply_command(
+        &mut self,
+        to: U::Id,
+        command: U::Command,
+    ) -> DispatchResult<U::Operation> {
         self.dispatch(vec![Dispatch::Command(to, command)])
     }
 
-    pub fn input(&mut self, input: &TerminalEvent) -> Vec<A::Operation> {
+    pub fn apply_terminal_event(&mut self, input: &TerminalEvent) -> DispatchResult<U::Operation> {
         if matches!(input, TerminalEvent::Key(key) if key.kind == KeyEventKind::Release) {
-            return Vec::new();
+            return DispatchResult {
+                operations: Vec::new(),
+                control_flow: ControlFlow::Continue(()),
+            };
         }
-        let mut effects = self.components.on_input(input);
+        let mut effects = self.ui.on_input(input);
         match input {
             TerminalEvent::FocusLost => {
-                self.focused = false;
+                self.focus = TerminalFocus::Lost;
                 self.keymap.cancel_pending();
             }
-            TerminalEvent::FocusGained => self.focused = true,
+            TerminalEvent::FocusGained => self.focus = TerminalFocus::Gained,
             TerminalEvent::Key(key) => {
                 if let Some((owner, command)) = self.resolve_key((*key).into()) {
                     effects = effects.send(owner, command);
@@ -98,34 +117,37 @@ impl<A: Components> Compositor<A> {
             }
             _ => {}
         }
-        self.apply(effects)
+        self.apply_effects(effects)
     }
 
-    pub fn event(&mut self, event: &A::Event) -> Vec<A::Operation> {
+    pub fn apply_event(&mut self, event: &U::Event) -> DispatchResult<U::Operation> {
         let mut pending = Vec::new();
         self.notify(std::slice::from_ref(event), &mut pending);
         self.dispatch(pending)
     }
 
-    fn apply(&mut self, effects: Effects<A>) -> Vec<A::Operation> {
+    pub(crate) fn apply_effects(&mut self, effects: Effects<U>) -> DispatchResult<U::Operation> {
         let mut pending = Vec::new();
         self.enqueue(effects, &mut pending);
         self.dispatch(pending)
     }
 
-    fn enqueue(&mut self, mut effects: Effects<A>, pending: &mut Vec<Dispatch<A>>) {
+    fn enqueue(&mut self, mut effects: Effects<U>, pending: &mut Vec<Dispatch<U>>) {
         let events = std::mem::take(&mut effects.events);
         // The originating reply runs after the replies to the facts it emitted.
         Dispatch::push_reply(pending, effects);
         self.notify(&events, pending);
     }
 
-    fn dispatch(&mut self, mut pending: Vec<Dispatch<A>>) -> Vec<A::Operation> {
+    fn dispatch(&mut self, mut pending: Vec<Dispatch<U>>) -> DispatchResult<U::Operation> {
         let mut operations = Vec::new();
+        let mut control_flow = ControlFlow::Continue(());
         while let Some(next) = pending.pop() {
             match next {
                 Dispatch::Reply(reply) => {
-                    self.quit |= reply.quit;
+                    if reply.quit {
+                        control_flow = ControlFlow::Break(());
+                    }
                     operations.extend(reply.operations);
                     pending.extend(
                         reply
@@ -137,26 +159,29 @@ impl<A: Components> Compositor<A> {
                 }
                 Dispatch::Command(to, command) => {
                     // A preceding command can have closed the addressed component.
-                    if self.components.component(to).is_some() {
-                        let reply = self.components.command(to, command);
+                    if self.ui.component(to).is_some() {
+                        let reply = self.ui.apply_command(to, command);
                         self.enqueue(reply, &mut pending);
                     }
                 }
             }
         }
         self.refresh();
-        operations
+        DispatchResult {
+            operations,
+            control_flow,
+        }
     }
 
     /// Finish notifying every subscriber before any of their commands runs.
-    fn notify(&mut self, events: &[A::Event], pending: &mut Vec<Dispatch<A>>) {
+    fn notify(&mut self, events: &[U::Event], pending: &mut Vec<Dispatch<U>>) {
         if events.is_empty() {
             return;
         }
         let first_reply = pending.len();
         let mut notifications = vec![Notification::new(Publication::Borrowed(events))];
         while let Some(notification) = notifications.last_mut() {
-            let Some((id, event)) = notification.next(&self.components) else {
+            let Some((id, event)) = notification.next(&self.ui) else {
                 let finished = notifications.pop().expect("current notification");
                 if let Publication::Reply(mut reply) = finished.publication {
                     reply.events.clear();
@@ -164,10 +189,10 @@ impl<A: Components> Compositor<A> {
                 }
                 continue;
             };
-            if let Some(component) = self.components.component_mut(id)
+            if let Some(component) = self.ui.component_mut(id)
                 && component.subscribes(event)
             {
-                let reply = component.on_event(event);
+                let reply = component.apply_event(event);
                 if reply.events.is_empty() {
                     Dispatch::push_reply(pending, reply);
                 } else {
@@ -180,13 +205,13 @@ impl<A: Components> Compositor<A> {
     }
 }
 
-enum Dispatch<A: Components> {
-    Reply(Effects<A>),
-    Command(A::Id, A::Command),
+enum Dispatch<U: Ui> {
+    Reply(Effects<U>),
+    Command(U::Id, U::Command),
 }
 
-impl<A: Components> Dispatch<A> {
-    fn push_reply(pending: &mut Vec<Self>, reply: Effects<A>) {
+impl<U: Ui> Dispatch<U> {
+    fn push_reply(pending: &mut Vec<Self>, reply: Effects<U>) {
         if reply.quit || !reply.commands.is_empty() || !reply.operations.is_empty() {
             pending.push(Self::Reply(reply));
         }
@@ -194,20 +219,20 @@ impl<A: Components> Dispatch<A> {
 }
 
 /// External events can be borrowed; a component's reply owns its nested events.
-enum Publication<'a, A: Components> {
-    Borrowed(&'a [A::Event]),
-    Reply(Effects<A>),
+enum Publication<'a, U: Ui> {
+    Borrowed(&'a [U::Event]),
+    Reply(Effects<U>),
 }
 
 /// The sibling subscribers and events to resume after a nested notification.
-struct Notification<'a, A: Components> {
-    publication: Publication<'a, A>,
+struct Notification<'a, U: Ui> {
+    publication: Publication<'a, U>,
     event: usize,
-    recipients: Option<std::vec::IntoIter<A::Id>>,
+    recipients: Option<std::vec::IntoIter<U::Id>>,
 }
 
-impl<'a, A: Components> Notification<'a, A> {
-    fn new(publication: Publication<'a, A>) -> Self {
+impl<'a, U: Ui> Notification<'a, U> {
+    fn new(publication: Publication<'a, U>) -> Self {
         Self {
             publication,
             event: 0,
@@ -215,15 +240,15 @@ impl<'a, A: Components> Notification<'a, A> {
         }
     }
 
-    fn next(&mut self, components: &A) -> Option<(A::Id, &A::Event)> {
+    fn next(&mut self, ui: &U) -> Option<(U::Id, &U::Event)> {
         let events = match &self.publication {
             Publication::Borrowed(events) => *events,
             Publication::Reply(reply) => &reply.events,
         };
         while let Some(event) = events.get(self.event) {
-            let ids = self.recipients.get_or_insert_with(|| {
-                components.ids().into_iter().collect::<Vec<_>>().into_iter()
-            });
+            let ids = self
+                .recipients
+                .get_or_insert_with(|| ui.ids().into_iter().collect::<Vec<_>>().into_iter());
             if let Some(id) = ids.next() {
                 return Some((id, event));
             }
@@ -237,7 +262,7 @@ impl<'a, A: Components> Notification<'a, A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppKeymap, Component};
+    use crate::{Component, UiKeymap};
 
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum Id {
@@ -267,15 +292,15 @@ mod tests {
         saw_selection: bool,
     }
 
-    impl Components for Window {
+    impl Ui for Window {
         type Id = Id;
         type Command = Command;
         type Event = Event;
         type Operation = &'static str;
         type Theme = ();
         type Layer = ();
-        type Keymap = AppKeymap<Self>;
-        type View<'a> = RenderContext<'a, Self>;
+        type Keymap = UiKeymap<Self>;
+        type Context<'a> = RenderContext<'a, Self>;
 
         fn theme(&self) -> &() {
             &()
@@ -298,10 +323,10 @@ mod tests {
                 Id::Tab => self.tab.as_mut().map(|tab| tab as &mut dyn Component<Self>),
             }
         }
-        fn command(&mut self, to: Id, command: Command) -> Effects<Self> {
+        fn apply_command(&mut self, to: Id, command: Command) -> Effects<Self> {
             self.component_mut(to)
                 .expect("a command has a live recipient")
-                .command(command)
+                .apply_command(command)
         }
     }
 
@@ -310,7 +335,7 @@ mod tests {
         fn subscribes(&self, _: &Event) -> bool {
             true
         }
-        fn on_event(&mut self, event: &Event) -> Effects<Window> {
+        fn apply_event(&mut self, event: &Event) -> Effects<Window> {
             match event {
                 Event::Count(0) => Effects::NONE.send(Id::Window, Command::Count(20_000)),
                 Event::Count(n) => Effects::NONE.emit(Event::Count(n - 1)),
@@ -329,7 +354,7 @@ mod tests {
                     .send(Id::Tab, Command::Select),
             }
         }
-        fn command(&mut self, command: Command) -> Effects<Window> {
+        fn apply_command(&mut self, command: Command) -> Effects<Window> {
             match command {
                 Command::Count(0) => Effects::NONE.operation("finished"),
                 Command::Count(n) => Effects::NONE.send(Id::Window, Command::Count(n - 1)),
@@ -343,7 +368,7 @@ mod tests {
         fn subscribes(&self, _: &Event) -> bool {
             true
         }
-        fn on_event(&mut self, event: &Event) -> Effects<Window> {
+        fn apply_event(&mut self, event: &Event) -> Effects<Window> {
             match event {
                 Event::Opened => Effects::NONE.operation("opened"),
                 Event::SelectTab => {
@@ -353,7 +378,7 @@ mod tests {
                 _ => panic!("tab received an event outside its lifetime"),
             }
         }
-        fn command(&mut self, command: Command) -> Effects<Window> {
+        fn apply_command(&mut self, command: Command) -> Effects<Window> {
             assert!(matches!(command, Command::Select));
             assert!(
                 self.saw_selection,
@@ -365,15 +390,18 @@ mod tests {
 
     #[test]
     fn finite_event_and_command_chains_finish_without_using_the_call_stack() {
-        let mut ui = Compositor::new(Window::default(), AppKeymap::<Window>::default());
-        assert_eq!(ui.event(&Event::Count(20_000)), ["finished"]);
+        let mut ui = Compositor::new(Window::default(), UiKeymap::<Window>::default());
+        assert_eq!(
+            ui.apply_event(&Event::Count(20_000)).operations,
+            ["finished"]
+        );
     }
 
     #[test]
     fn nested_events_see_new_tabs_and_closing_a_tab_drops_late_deliveries() {
-        let mut ui = Compositor::new(Window::default(), AppKeymap::<Window>::default());
-        assert_eq!(ui.event(&Event::Open), ["opened"]);
-        assert_eq!(ui.event(&Event::Close), [] as [&str; 0]);
+        let mut ui = Compositor::new(Window::default(), UiKeymap::<Window>::default());
+        assert_eq!(ui.apply_event(&Event::Open).operations, ["opened"]);
+        assert_eq!(ui.apply_event(&Event::Close).operations, [] as [&str; 0]);
     }
 
     #[test]
@@ -381,9 +409,9 @@ mod tests {
         let window = Window {
             tab: Some(Tab::default()),
         };
-        let mut ui = Compositor::new(window, AppKeymap::<Window>::default());
+        let mut ui = Compositor::new(window, UiKeymap::<Window>::default());
         assert_eq!(
-            ui.event(&Event::SelectTab),
+            ui.apply_event(&Event::SelectTab).operations,
             ["opened", "window", "selected", "tab"]
         );
     }

@@ -2,7 +2,9 @@ use std::{env, error::Error, io, path::PathBuf, sync::Arc};
 
 use serde::Deserialize;
 use tuiframework::{
-    AppKeymap, Application, Component, Components, Driver, DriverContext, Effects,
+    Component, Compositor, Driver, DriverContext, Effects, EventLoop, Hooks, Terminal,
+    TerminalDevice, TerminalOptions, Ui, UiKeymap,
+    crossterm::event::EventStream,
     keymap::KeymapConfig,
     ratatui::style::Style,
     theme::{Palette, Styles},
@@ -87,16 +89,16 @@ impl Files {
     }
 }
 
-impl Components for Files {
+impl Ui for Files {
     type Command = Command;
-    type Keymap = AppKeymap<Self>;
+    type Keymap = UiKeymap<Self>;
     type Event = Event;
     type Operation = Operation;
     type Theme = FileTheme;
     fn theme(&self) -> &FileTheme {
         &self.theme
     }
-    type View<'a> = tuiframework::RenderContext<'a, Self>;
+    type Context<'a> = tuiframework::RenderContext<'a, Self>;
     type Layer = Layer;
     type Id = Id;
     fn ids(&self) -> impl IntoIterator<Item = Id> {
@@ -117,7 +119,7 @@ impl Components for Files {
         })
     }
 
-    fn command(&mut self, to: Id, command: Command) -> Effects<Self> {
+    fn apply_command(&mut self, to: Id, command: Command) -> Effects<Self> {
         if let Command::ToggleTheme = command {
             self.theme = if self.theme.common.palette == Palette::dracula() {
                 Palette::ferra().into()
@@ -127,15 +129,11 @@ impl Components for Files {
             return Effects::NONE;
         }
         self.component_mut(to)
-            .map_or(Effects::NONE, |component| component.command(command))
+            .map_or(Effects::NONE, |component| component.apply_command(command))
     }
 
     fn visible(&self) -> impl IntoIterator<Item = Id> {
         std::iter::once(Id::Files).chain(self.sort.open.then_some(Id::Sort))
-    }
-
-    fn start(&mut self) -> Effects<Self> {
-        Effects::NONE.send(Id::Files, Command::Reload)
     }
 
     fn is_busy(&self) -> bool {
@@ -148,7 +146,9 @@ impl Components for Files {
 
 struct FileSystem;
 
-impl Driver<Files> for FileSystem {
+impl Driver for FileSystem {
+    type Operation = Operation;
+    type Event = Event;
     fn dispatch(
         &mut self,
         Operation::ReadDirectory(path): Operation,
@@ -170,9 +170,9 @@ impl FileSystem {
     }
 }
 
-fn keymap() -> Result<AppKeymap<Files>, Box<dyn Error>> {
+fn keymap() -> Result<UiKeymap<Files>, Box<dyn Error>> {
     let config: KeymapConfig<Layer, Command> = toml::from_str(include_str!("keys.toml"))?;
-    Ok(AppKeymap::<Files>::compile(config)?)
+    Ok(UiKeymap::<Files>::compile(config)?)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -180,10 +180,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()
         .nth(1)
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
-    Application::builder()
-        .components(Files::new(path, Palette::default().into()))
+    let files = Files::new(path, Palette::default().into());
+    let hooks = Hooks::default().on_start(Box::new(|_, _| {
+        Effects::NONE.send(Id::Files, Command::Reload)
+    }));
+    let mut device = TerminalDevice::stdout();
+    device.install_abort_hook();
+    EventLoop::builder()
+        .compositor(Compositor::new(files, keymap()?))
         .driver(FileSystem)
-        .keymap(keymap()?)
+        .terminal(Terminal::init(&mut device, TerminalOptions::default())?)
+        .input(EventStream::new())
+        .hooks(hooks)
         .build()
         .run()
         .await?;

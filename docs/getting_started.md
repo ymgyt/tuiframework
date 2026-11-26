@@ -30,7 +30,9 @@ use std::{error::Error, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
 use serde::Deserialize;
 use tuiframework::{
-    AppKeymap, Application, Component, Components, Driver, DriverContext, Effects, RenderContext,
+    Component, Compositor, Driver, DriverContext, Effects, EventLoop, Hooks, RenderContext,
+    Terminal, TerminalDevice, TerminalOptions, Ui, UiKeymap,
+    crossterm::event::EventStream,
     keymap::KeymapConfig,
     ratatui::{Frame, style::{Color, Style}, widgets::Paragraph},
     theme::Styles,
@@ -68,15 +70,15 @@ struct Clock {
 #[serde(rename_all = "lowercase")]
 enum Layer { Clock }
 
-impl Components for Clock {
+impl Ui for Clock {
     type Id = ();
     type Layer = Layer;
     type Command = Command;
-    type Keymap = AppKeymap<Self>;
+    type Keymap = UiKeymap<Self>;
     type Event = Event;
     type Operation = Operation;
     type Theme = ClockTheme;
-    type View<'a> = RenderContext<'a, Self>;
+    type Context<'a> = RenderContext<'a, Self>;
 
     fn theme(&self) -> &ClockTheme { &self.theme }
     fn ids(&self) -> impl IntoIterator<Item = ()> { [()] }
@@ -85,10 +87,6 @@ impl Components for Clock {
         Some(&mut self.screen)
     }
     fn visible(&self) -> impl IntoIterator<Item = ()> { [()] }
-
-    fn start(&mut self) -> Effects<Self> {
-        Effects::NONE.send((), Command::Refresh)
-    }
 }
 
 ```
@@ -101,7 +99,7 @@ The screen declares which key layers it owns. Pressing a bound key calls its `co
 impl Component<Clock> for ClockScreen {
     fn key_layers(&self) -> &[Layer] { &[Layer::Clock] }
 
-    fn command(&mut self, command: Command) -> Effects<Clock> {
+    fn apply_command(&mut self, command: Command) -> Effects<Clock> {
         match command {
             Command::Refresh => Effects::NONE.operation(Operation::ReadClock),
             Command::Quit => Effects::NONE.quit(),
@@ -110,7 +108,7 @@ impl Component<Clock> for ClockScreen {
 
     fn subscribes(&self, event: &Event) -> bool { matches!(event, Event::Read(_)) }
 
-    fn on_event(&mut self, Event::Read(seconds): &Event) -> Effects<Clock> {
+    fn apply_event(&mut self, Event::Read(seconds): &Event) -> Effects<Clock> {
         self.seconds = Some(*seconds);
         Effects::NONE
     }
@@ -132,7 +130,10 @@ Reading the system clock is synchronous. The driver uses `emit` to queue the res
 ```rust
 struct SystemClock;
 
-impl Driver<Clock> for SystemClock {
+impl Driver for SystemClock {
+    type Event = Event;
+    type Operation = Operation;
+
     fn dispatch(&mut self, operation: Operation, cx: &mut DriverContext<Event>) {
         match operation {
             Operation::ReadClock => {
@@ -167,13 +168,13 @@ struct Settings {
     reading_color: Option<String>,
 }
 
-fn settings(path: Option<PathBuf>) -> Result<(ClockTheme, AppKeymap<Clock>), Box<dyn Error>> {
+fn settings(path: Option<PathBuf>) -> Result<(ClockTheme, UiKeymap<Clock>), Box<dyn Error>> {
     let user: Settings = match path {
         Some(path) => toml::from_str(&std::fs::read_to_string(path)?)?,
         None => Settings::default(),
     };
     let defaults: KeymapConfig<Layer, Command> = toml::from_str(DEFAULT_KEYS)?;
-    let keys = AppKeymap::<Clock>::compile(defaults.with_overrides(user.keys)?)?;
+    let keys = UiKeymap::<Clock>::compile(defaults.with_overrides(user.keys)?)?;
     let common = Styles::default();
     let color = match user.reading_color {
         Some(name) => name.parse::<Color>()?,
@@ -187,10 +188,16 @@ fn settings(path: Option<PathBuf>) -> Result<(ClockTheme, AppKeymap<Clock>), Box
 async fn main() -> Result<(), Box<dyn Error>> {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let (theme, keys) = settings(path)?;
-    Application::builder()
-        .components(Clock { screen: ClockScreen::default(), theme })
+    let clock = Clock { screen: ClockScreen::default(), theme };
+    let hooks = Hooks::default().on_start(Box::new(|_, _| Effects::NONE.send((), Command::Refresh)));
+    let mut device = TerminalDevice::stdout();
+    device.install_abort_hook();
+    EventLoop::builder()
+        .compositor(Compositor::new(clock, keys))
         .driver(SystemClock)
-        .keymap(keys)
+        .terminal(Terminal::init(&mut device, TerminalOptions::default())?)
+        .input(EventStream::new())
+        .hooks(hooks)
         .build()
         .run()
         .await?;
