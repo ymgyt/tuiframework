@@ -30,6 +30,7 @@
         devShells.default = pkgs.mkShell {
           packages = [
             toolchain
+            pkgs.cargo-release
             pkgs.just
           ];
         };

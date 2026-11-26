@@ -1,8 +1,7 @@
-name: Release
+name: CD
 on:
   push:
-    # The initial release is published locally before a trusted publisher can be registered.
-    tags: ["v*", "!v0.1.0"]
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
 
 permissions:
@@ -15,16 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v32
-
-      - name: Check that the tag matches the crate version
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          version=$(nix develop --command cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "tuiframework") | .version')
-          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::Expected v$version for this Cargo.toml, got $GITHUB_REF_NAME"
-            exit 1
-          fi
 
       - run: nix develop --command just check
       - run: nix develop --command just publish-dry-run

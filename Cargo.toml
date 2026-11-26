@@ -9,6 +9,11 @@ repository = "https://github.com/ymgyt/tuiframework"
 keywords = ["tui", "ratatui", "keymap"]
 categories = ["command-line-interface", "asynchronous"]
 
+[package.metadata.release]
+allow-branch = ["main"]
+tag-name = "v{{version}}"
+publish = false # cd.yaml publishes the tagged version.
+
 [features]
 unstable-rendered-line-info = ["ratatui/unstable-rendered-line-info"]
 

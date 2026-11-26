@@ -21,6 +21,11 @@ test:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 
+# Preview a release with `just release patch`. Add `--execute` to commit, tag, and push.
+[positional-arguments]
+release level *options:
+    cargo release "$@"
+
 # Build and verify the package that would be uploaded to crates.io.
 publish-dry-run:
     cargo publish --locked --registry crates-io --dry-run
