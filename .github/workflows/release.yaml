@@ -1,14 +1,15 @@
 name: Release
 on:
   push:
-    tags: ["v*"]
+    # The initial release is published locally before a trusted publisher can be registered.
+    tags: ["v*", "!v0.1.0"]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  publish:
+  check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -26,10 +27,23 @@ jobs:
           fi
 
       - run: nix develop --command just check
-      - run: nix develop --command cargo publish --locked --dry-run
+      - run: nix develop --command just publish-dry-run
 
+  publish:
+    needs: check
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v32
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish to crates.io
-        if: github.event_name == 'push'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-        run: nix develop --command cargo publish --locked --registry crates-io
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: nix develop --command just publish
