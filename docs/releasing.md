@@ -10,11 +10,10 @@ Verify the package from the repository root.
 just publish-dry-run
 ```
 
-Publish with a crates.io token scoped to `tuiframework` with the `publish-new` permission.
-Paste the token at the prompt. The recipe passes it to Cargo for this invocation.
+Publish with `CARGO_REGISTRY_TOKEN` set to a token that grants `publish-new` for `tuiframework`.
 
 ```sh
-just publish-first
+just publish
 ```
 
 After Cargo reports that the crate is published, tag the same commit.
