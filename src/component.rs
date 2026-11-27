@@ -1,110 +1,106 @@
+use crossterm::event::Event as TerminalEvent;
 use ratatui::{Frame, layout::Rect};
 
-use crate::{TerminalFocus, Ui, keymap::LayerStack};
+use crate::{Components, TerminalFocus, keymap::LayerStack, overlay::DisplayChange};
 
-/// One addressable part of an application. State changes stay with its owner.
-pub trait Component<U: Ui> {
-    fn render(&self, frame: &mut Frame<'_>, cx: &U::Context<'_>);
-
-    fn key_layers(&self) -> &[U::Layer] {
+/// An addressable part of the application. Hidden components can still receive events.
+pub trait Component<C: Components> {
+    fn render(&self, frame: &mut Frame<'_>, cx: &C::RenderContext<'_>);
+    fn key_layers(&self) -> &[C::Layer] {
         &[]
     }
-
-    fn mask_lower_layers(&self, _layers: &mut LayerStack<U::Layer, U::Id>) {}
-
-    fn apply_command(&mut self, _command: U::Command) -> Effects<U> {
-        Effects::NONE
-    }
-
-    /// Checked in registration order for each published event, including while hidden.
-    fn subscribes(&self, _event: &U::Event) -> bool {
+    fn mask_lower_layers(&self, _layers: &mut LayerStack<C::Layer, C::Id>) {}
+    fn update_keymap(&mut self, _keymap: &mut C::Keymap) {}
+    fn apply_command(&mut self, _command: C::Command, _effects: &mut Effects<C>) {}
+    fn subscribes(&self, _event: &C::Event) -> bool {
         false
     }
-
-    fn apply_event(&mut self, _event: &U::Event) -> Effects<U> {
-        Effects::NONE
+    fn apply_event(&mut self, _event: &C::Event, _effects: &mut Effects<C>) {}
+    /// Observes accepted terminal input. Only the frontmost component receives `frontmost = true`.
+    fn on_input(&mut self, _input: &TerminalEvent, _frontmost: bool, _effects: &mut Effects<C>) {}
+    fn is_busy(&self) -> bool {
+        false
     }
+    fn tick(&mut self) {}
 }
 
-/// The shared state and resolved input layers for the frame being drawn.
-pub struct RenderContext<'a, U: Ui> {
-    pub ui: &'a U,
-    pub theme: &'a U::Theme,
+/// Shared input to the application's per-frame render context.
+pub struct RenderInputs<'a, C: Components> {
+    pub components: &'a C,
     pub area: Rect,
     pub focus: TerminalFocus,
-    pub keymap: &'a U::Keymap,
-    pub layers: &'a LayerStack<U::Layer, U::Id>,
+    pub keymap: &'a C::Keymap,
+    pub layers: &'a LayerStack<C::Layer, C::Id>,
 }
 
-/// Facts, addressed commands, and external operations produced by one state transition.
-///
-/// Events reach subscribers in registration order. Each subscriber's nested
-/// events reach their subscribers before the next subscriber receives the
-/// original event. Once all those notifications finish, their replies run in
-/// that same depth-first completion order, followed by the originating reply.
-/// Each reply contributes its operations and runs its commands in order. The
-/// driver receives the collected operations after all commands have run.
-#[must_use]
-pub struct Effects<U: Ui> {
-    pub(crate) events: Vec<U::Event>,
-    pub(crate) commands: Vec<(U::Id, U::Command)>,
-    pub(crate) operations: Vec<U::Operation>,
+/// Effects available at startup and to embedding applications.
+pub struct ApplicationEffects<C: Components> {
+    pub(crate) events: Vec<C::Event>,
+    pub(crate) operations: Vec<C::Operation>,
     pub(crate) quit: bool,
 }
 
-impl<U: Ui> Effects<U> {
-    pub const NONE: Self = Self {
-        events: Vec::new(),
-        commands: Vec::new(),
-        operations: Vec::new(),
-        quit: false,
-    };
-
-    /// Publishes a fact to all interested components.
-    pub fn emit(mut self, event: U::Event) -> Self {
-        self.events.push(event);
-        self
-    }
-
-    /// Addresses a follow-up command to a component, including one currently hidden.
-    pub fn send(mut self, to: U::Id, command: U::Command) -> Self {
-        self.commands.push((to, command));
-        self
-    }
-
-    /// Delivers a batch to the same component in order.
-    pub fn send_all(mut self, to: U::Id, commands: impl IntoIterator<Item = U::Command>) -> Self {
-        self.commands
-            .extend(commands.into_iter().map(|command| (to, command)));
-        self
-    }
-
-    /// Requests work from the application's driver.
-    pub fn operation(mut self, operation: U::Operation) -> Self {
-        self.operations.push(operation);
-        self
-    }
-
-    /// Collects an ordered batch of work produced by one transition.
-    pub fn from_operations(operations: impl IntoIterator<Item = U::Operation>) -> Self {
+impl<C: Components> Default for ApplicationEffects<C> {
+    fn default() -> Self {
         Self {
-            operations: operations.into_iter().collect(),
-            ..Self::NONE
+            events: Vec::new(),
+            operations: Vec::new(),
+            quit: false,
         }
     }
+}
 
-    /// Addressed commands in delivery order.
-    pub fn commands(&self) -> &[(U::Id, U::Command)] {
-        &self.commands
+impl<C: Components> ApplicationEffects<C> {
+    pub fn emit(&mut self, event: C::Event) {
+        self.events.push(event);
     }
-
-    /// External operations in dispatch order.
-    pub fn operations(&self) -> &[U::Operation] {
-        &self.operations
+    pub fn operation(&mut self, operation: C::Operation) {
+        self.operations.push(operation);
     }
-
-    pub fn quit(mut self) -> Self {
+    pub fn quit(&mut self) {
         self.quit = true;
-        self
+    }
+}
+
+/// Effects of one component's input, command or event handler.
+/// Display changes act on the component that issued them and are applied when its handler returns.
+/// Published facts then reach subscribers in registration order, including hidden ones.
+/// Nested facts complete before the next subscriber receives the parent fact. The driver
+/// receives the accumulated external operations after the transition finishes.
+pub struct Effects<C: Components> {
+    pub(crate) app: ApplicationEffects<C>,
+    pub(crate) display: Vec<DisplayChange<C>>,
+}
+
+impl<C: Components> Default for Effects<C> {
+    fn default() -> Self {
+        Self {
+            app: ApplicationEffects::default(),
+            display: Vec::new(),
+        }
+    }
+}
+
+impl<C: Components> Effects<C> {
+    pub fn open(&mut self, overlay: C::OverlayId) {
+        self.display.push(DisplayChange::Open(overlay));
+    }
+    pub fn push(&mut self, stack: C::StackId) {
+        self.display.push(DisplayChange::Push(stack));
+    }
+    pub fn close(&mut self) {
+        self.display.push(DisplayChange::Close);
+    }
+    pub fn emit(&mut self, event: C::Event) {
+        self.app.emit(event);
+    }
+    pub fn operation(&mut self, operation: C::Operation) {
+        self.app.operation(operation);
+    }
+    pub fn operations(&mut self, operations: impl IntoIterator<Item = C::Operation>) {
+        self.app.operations.extend(operations);
+    }
+    pub fn quit(&mut self) {
+        self.app.quit();
     }
 }

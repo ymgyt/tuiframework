@@ -1,6 +1,7 @@
-use crate::{Effects, Ui};
+use crate::{ApplicationEffects, Components};
 
-pub(super) type OnStart<'a, U, D> = Box<dyn FnOnce(&mut U, &mut D) -> Effects<U> + 'a>;
+pub(super) type OnStart<'a, U, D> =
+    Box<dyn FnOnce(&mut U, &mut D, &mut ApplicationEffects<U>) + 'a>;
 pub(super) type Callback<'a, U, D> = Box<dyn FnOnce(&U, &mut D) + 'a>;
 
 /// Callbacks for startup, a normal quit request, and shutdown.
@@ -9,13 +10,13 @@ pub(super) type Callback<'a, U, D> = Box<dyn FnOnce(&U, &mut D) + 'a>;
 /// When processing events manually, the started loop can still be inspected
 /// after `on_quit`. Dropping it invokes `on_exit`.
 #[must_use]
-pub struct Hooks<'a, U: Ui, D> {
+pub struct Hooks<'a, U: Components, D> {
     pub(super) start: Option<OnStart<'a, U, D>>,
     pub(super) quit: Option<Callback<'a, U, D>>,
     pub(super) exit: Option<Callback<'a, U, D>>,
 }
 
-impl<U: Ui, D> Default for Hooks<'_, U, D> {
+impl<U: Components, D> Default for Hooks<'_, U, D> {
     fn default() -> Self {
         Self {
             start: None,
@@ -25,7 +26,7 @@ impl<U: Ui, D> Default for Hooks<'_, U, D> {
     }
 }
 
-impl<'a, U: Ui, D> Hooks<'a, U, D> {
+impl<'a, U: Components, D> Hooks<'a, U, D> {
     /// Produces the initial effects before the first frame.
     pub fn on_start(mut self, callback: OnStart<'a, U, D>) -> Self {
         self.start = Some(callback);

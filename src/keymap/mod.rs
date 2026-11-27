@@ -9,7 +9,7 @@ use std::{collections::HashMap, hash::Hash};
 
 use thiserror::Error;
 
-use crate::Ui;
+use crate::Components;
 
 pub use config::{Binding, KeymapConfig};
 pub use key::{KeySequence, KeyStroke};
@@ -19,15 +19,16 @@ pub use trie::LayerKeymap;
 use trie::Lookup;
 
 /// Keymap built from the command, layer, and component types of a UI.
-pub type UiKeymap<U, B = <U as Ui>::Command> = Keymap<<U as Ui>::Layer, B, <U as Ui>::Id>;
+pub type UiKeymap<U, B = <U as Components>::Command> =
+    Keymap<<U as Components>::Layer, B, <U as Components>::Id>;
 
 /// Resolves a binding to its destination and command once the active layer's
 /// owner is known. Binding a command directly sends it to that owner.
-pub trait KeyAction<U: Ui> {
+pub trait KeyAction<U: Components> {
     fn command_for(self, owner: U::Id) -> (U::Id, U::Command);
 }
 
-impl<U: Ui> KeyAction<U> for U::Command {
+impl<U: Components> KeyAction<U> for U::Command {
     fn command_for(self, owner: U::Id) -> (U::Id, U::Command) {
         (owner, self)
     }
@@ -47,7 +48,7 @@ pub enum KeymapError {
 
 /// An application's compiled bindings. The compositor supplies the active layers
 /// and delivers a match to the component that owns its layer.
-pub trait KeyBindings<U: Ui> {
+pub trait KeyBindings<U: Components> {
     /// Resolves one key to its destination and domain command.
     fn resolve_command(
         &mut self,
@@ -285,7 +286,7 @@ impl<L: Copy + Eq + Hash, C: Clone, I: Copy + Eq> Keymap<L, C, I> {
     }
 }
 
-impl<U: Ui, B: Clone + KeyAction<U>> KeyBindings<U> for Keymap<U::Layer, B, U::Id> {
+impl<U: Components, B: Clone + KeyAction<U>> KeyBindings<U> for Keymap<U::Layer, B, U::Id> {
     fn resolve_command(
         &mut self,
         layers: &LayerStack<U::Layer, U::Id>,

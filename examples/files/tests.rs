@@ -37,11 +37,13 @@ where
     I: futures_util::Stream<Item = io::Result<Input>> + Unpin,
 {
     let files = Files::new(".".into(), Palette::ferra().into());
-    let hooks = Hooks::default().on_start(Box::new(|_, _| {
-        Effects::NONE.send(Id::Files, Command::Reload)
+    let hooks = Hooks::default().on_start(Box::new(|_, _, effects| {
+        effects.emit(Event::Started);
     }));
     EventLoop::builder()
-        .compositor(Compositor::new(files, keymap().unwrap()))
+        .components(files)
+        .overlay(Overlay::named(()).component(Id::Files))
+        .keymap(keymap().unwrap())
         .driver(driver)
         .terminal(terminal)
         .input(input)
@@ -92,9 +94,9 @@ async fn queued_reload_keys_are_handled_before_a_completed_directory_read() {
     for _ in 0..KEY_COUNT {
         app.process_next().await.unwrap();
     }
-    assert!(app.ui().is_busy());
+    assert!(app.is_busy());
     app.process_next().await.unwrap();
-    assert!(!app.ui().is_busy());
+    assert!(!app.is_busy());
     assert_eq!(reads.get(), 1);
 }
 
@@ -138,9 +140,9 @@ fn moving_back_up_keeps_the_viewport_and_resizing_keeps_the_selection() {
     let terminal = Terminal::new(TestBackend::new(24, 5)).unwrap();
     let mut app = application(PendingRead, terminal, stream::pending()).start();
     let names = ["alpha", "bravo", "charlie", "delta"].map(str::to_owned);
-    app.apply_effects(Effects::NONE.emit(Event::Loaded(Ok(names.into()))));
+    app.apply_effects(|effects| effects.emit(Event::Loaded(Ok(names.into()))));
     for _ in 0..3 {
-        app.apply_effects(Effects::NONE.send(Id::Files, Command::Next));
+        app.apply_command(Id::Files, Command::Next);
         app.render().unwrap();
     }
     assert_eq!(
@@ -148,7 +150,7 @@ fn moving_back_up_keeps_the_viewport_and_resizing_keeps_the_selection() {
         ["  bravo", "  charlie", "> delta"]
     );
 
-    app.apply_effects(Effects::NONE.send(Id::Files, Command::Previous));
+    app.apply_command(Id::Files, Command::Previous);
     app.render().unwrap();
     assert_eq!(
         &rows(app.terminal())[1..4],

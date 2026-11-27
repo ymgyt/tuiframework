@@ -1,7 +1,7 @@
 use std::{cell::Cell, path::PathBuf, sync::Arc};
 
 use tuiframework::{
-    Component, Effects, RenderContext,
+    Component, Effects, RenderInputs,
     ratatui::{
         Frame,
         layout::{Constraint, Layout},
@@ -9,10 +9,12 @@ use tuiframework::{
     },
 };
 
-use super::{Command, Event, Files, Id, Layer, Operation, Order};
+use super::{Command, Event, FileTheme, Files, Layer, Operation, Order};
+use tuiframework::theme::Palette;
 
 /// Directory contents and selection for the base screen.
 pub(super) struct Listing {
+    pub(super) theme: FileTheme,
     path: PathBuf,
     names: Arc<[String]>,
     selected: usize,
@@ -24,9 +26,10 @@ pub(super) struct Listing {
 }
 
 impl Listing {
-    pub(super) fn new(path: PathBuf) -> Self {
+    pub(super) fn new(path: PathBuf, theme: FileTheme) -> Self {
         Self {
             path,
+            theme,
             names: Arc::default(),
             selected: 0,
             offset: Cell::new(0),
@@ -38,18 +41,20 @@ impl Listing {
     }
 
     const SPINNER: [char; 4] = ['|', '/', '-', '\\'];
-
-    pub(super) fn tick(&mut self) {
-        self.tick = (self.tick + 1) % Self::SPINNER.len();
-    }
 }
 
 impl Component<Files> for Listing {
+    fn is_busy(&self) -> bool {
+        self.loading
+    }
+    fn tick(&mut self) {
+        self.tick = (self.tick + 1) % Self::SPINNER.len();
+    }
     fn key_layers(&self) -> &[Layer] {
         &[Layer::Global, Layer::List, Layer::Files]
     }
 
-    fn apply_command(&mut self, command: Command) -> Effects<Files> {
+    fn apply_command(&mut self, command: Command, effects: &mut Effects<Files>) {
         match command {
             Command::Next => {
                 self.selected = (self.selected + 1).min(self.names.len().saturating_sub(1));
@@ -59,21 +64,29 @@ impl Component<Files> for Listing {
             Command::Reload if !self.loading => {
                 self.loading = true;
                 self.error = None;
-                return Effects::NONE.operation(Operation::ReadDirectory(self.path.clone()));
+                effects.operation(Operation::ReadDirectory(self.path.clone()));
             }
-            Command::OpenSort => return Effects::NONE.send(Id::Sort, command),
-            Command::Quit => return Effects::NONE.quit(),
+            Command::OpenSort => effects.emit(Event::SortRequested),
+            Command::Quit => effects.quit(),
+            Command::ToggleTheme => {
+                self.theme = if self.theme.common.palette == Palette::dracula() {
+                    Palette::ferra().into()
+                } else {
+                    Palette::dracula().into()
+                };
+            }
             _ => {}
         }
-        Effects::NONE
     }
 
     fn subscribes(&self, _: &Event) -> bool {
         true
     }
 
-    fn apply_event(&mut self, event: &Event) -> Effects<Files> {
+    fn apply_event(&mut self, event: &Event, effects: &mut Effects<Files>) {
         match event {
+            Event::Started => self.apply_command(Command::Reload, effects),
+            Event::SortRequested => {}
             Event::Loaded(result) => {
                 self.loading = false;
                 match result {
@@ -89,11 +102,10 @@ impl Component<Files> for Listing {
                 self.selected = 0;
             }
         }
-        Effects::NONE
     }
 
-    fn render(&self, frame: &mut Frame<'_>, cx: &RenderContext<'_, Files>) {
-        let theme = &cx.theme.common;
+    fn render(&self, frame: &mut Frame<'_>, cx: &RenderInputs<'_, Files>) {
+        let theme = &self.theme.common;
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
@@ -108,7 +120,7 @@ impl Component<Files> for Listing {
             format!("{path}   {} files", self.names.len())
         };
         let style = if self.loading {
-            cx.theme.loading
+            self.theme.loading
         } else {
             theme.title
         };

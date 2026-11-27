@@ -2,8 +2,8 @@ use std::{env, error::Error, io, path::PathBuf, sync::Arc};
 
 use serde::Deserialize;
 use tuiframework::{
-    Component, Compositor, Driver, DriverContext, Effects, EventLoop, Hooks, Terminal,
-    TerminalOptions, Ui, UiKeymap,
+    Component, Components, Driver, DriverContext, EventLoop, Hooks, Overlay, Terminal,
+    TerminalOptions, UiKeymap,
     crossterm::event::EventStream,
     keymap::KeymapConfig,
     ratatui::style::Style,
@@ -50,6 +50,8 @@ enum Command {
 enum Event {
     Loaded(io::Result<Arc<[String]>>),
     Sorted(Order),
+    SortRequested,
+    Started,
 }
 
 enum Operation {
@@ -76,71 +78,43 @@ impl From<Palette> for FileTheme {
 struct Files {
     listing: Listing,
     sort: SortMenu,
-    theme: FileTheme,
 }
 
 impl Files {
     fn new(path: PathBuf, theme: FileTheme) -> Self {
         Self {
-            listing: Listing::new(path),
+            listing: Listing::new(path, theme),
             sort: SortMenu::default(),
-            theme,
         }
     }
 }
 
-impl Ui for Files {
+impl Components for Files {
     type Command = Command;
     type Keymap = UiKeymap<Self>;
     type Event = Event;
     type Operation = Operation;
-    type Theme = FileTheme;
-    fn theme(&self) -> &FileTheme {
-        &self.theme
-    }
-    type Context<'a> = tuiframework::RenderContext<'a, Self>;
+    type OverlayId = ();
+    type StackId = std::convert::Infallible;
+    type RenderContext<'a> = tuiframework::RenderInputs<'a, Self>;
     type Layer = Layer;
     type Id = Id;
     fn ids(&self) -> impl IntoIterator<Item = Id> {
         [Id::Files, Id::Sort]
     }
 
-    fn component(&self, id: Id) -> Option<&dyn Component<Self>> {
+    fn get(&self, id: Id) -> Option<&dyn Component<Self>> {
         Some(match id {
             Id::Files => &self.listing,
             Id::Sort => &self.sort,
         })
     }
 
-    fn component_mut(&mut self, id: Id) -> Option<&mut dyn Component<Self>> {
+    fn get_mut(&mut self, id: Id) -> Option<&mut dyn Component<Self>> {
         Some(match id {
             Id::Files => &mut self.listing,
             Id::Sort => &mut self.sort,
         })
-    }
-
-    fn apply_command(&mut self, to: Id, command: Command) -> Effects<Self> {
-        if let Command::ToggleTheme = command {
-            self.theme = if self.theme.common.palette == Palette::dracula() {
-                Palette::ferra().into()
-            } else {
-                Palette::dracula().into()
-            };
-            return Effects::NONE;
-        }
-        self.component_mut(to)
-            .map_or(Effects::NONE, |component| component.apply_command(command))
-    }
-
-    fn visible(&self) -> impl IntoIterator<Item = Id> {
-        std::iter::once(Id::Files).chain(self.sort.open.then_some(Id::Sort))
-    }
-
-    fn is_busy(&self) -> bool {
-        self.listing.loading
-    }
-    fn tick(&mut self) {
-        self.listing.tick();
     }
 }
 
@@ -181,12 +155,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .nth(1)
         .map_or_else(|| PathBuf::from("."), PathBuf::from);
     let files = Files::new(path, Palette::default().into());
-    let hooks = Hooks::default().on_start(Box::new(|_, _| {
-        Effects::NONE.send(Id::Files, Command::Reload)
+    let hooks = Hooks::default().on_start(Box::new(|_, _, effects| {
+        effects.emit(Event::Started);
     }));
     let options = TerminalOptions::default().with_restore_on_panic_abort(true);
     EventLoop::builder()
-        .compositor(Compositor::new(files, keymap()?))
+        .components(files)
+        .overlay(Overlay::named(()).component(Id::Files))
+        .keymap(keymap()?)
         .driver(FileSystem)
         .terminal(Terminal::init(options)?)
         .input(EventStream::new())

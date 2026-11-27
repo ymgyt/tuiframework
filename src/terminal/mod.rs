@@ -83,8 +83,8 @@ impl Terminal {
 impl RenderTarget for Terminal {
     type Error = io::Error;
 
-    fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
-        self.inner.draw(|frame| {
+    fn render(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> io::Result<()> {
+        self.inner.render(|frame| {
             render(frame);
             if self.monochrome {
                 for cell in &mut frame.buffer_mut().content {
@@ -93,8 +93,7 @@ impl RenderTarget for Terminal {
                     cell.underline_color = Color::Reset;
                 }
             }
-        })?;
-        Ok(())
+        })
     }
 
     fn force_redraw(&mut self) -> io::Result<()> {

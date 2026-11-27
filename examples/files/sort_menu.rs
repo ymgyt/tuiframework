@@ -1,5 +1,5 @@
 use tuiframework::{
-    Component, Effects, RenderContext,
+    Component, Effects, RenderInputs,
     keymap::LayerStack,
     ratatui::{
         Frame,
@@ -19,7 +19,6 @@ pub(super) enum Order {
 
 #[derive(Default)]
 pub(super) struct SortMenu {
-    pub(super) open: bool,
     selected: usize,
     applied: usize,
 }
@@ -33,31 +32,35 @@ impl Component<Files> for SortMenu {
         layers.cover(&[Layer::Files]);
     }
 
-    fn apply_command(&mut self, command: Command) -> Effects<Files> {
+    fn subscribes(&self, event: &Event) -> bool {
+        matches!(event, Event::SortRequested)
+    }
+
+    fn apply_event(&mut self, _: &Event, effects: &mut Effects<Files>) {
+        self.selected = self.applied;
+        effects.open(());
+    }
+
+    fn apply_command(&mut self, command: Command, effects: &mut Effects<Files>) {
         match command {
-            Command::OpenSort => {
-                self.selected = self.applied;
-                self.open = true;
-            }
             Command::Next => self.selected = 1,
             Command::Previous | Command::First => self.selected = 0,
-            Command::Close => self.open = false,
+            Command::Close => effects.close(),
             Command::Choose => {
-                self.open = false;
+                effects.close();
                 self.applied = self.selected;
                 let order = if self.selected == 0 {
                     Order::Ascending
                 } else {
                     Order::Descending
                 };
-                return Effects::NONE.emit(Event::Sorted(order));
+                effects.emit(Event::Sorted(order));
             }
             _ => {}
         }
-        Effects::NONE
     }
 
-    fn render(&self, frame: &mut Frame<'_>, cx: &RenderContext<'_, Files>) {
+    fn render(&self, frame: &mut Frame<'_>, cx: &RenderInputs<'_, Files>) {
         let [row] = Layout::vertical([Constraint::Length(4)])
             .flex(Flex::Center)
             .areas(frame.area());
@@ -68,10 +71,10 @@ impl Component<Files> for SortMenu {
             .block(
                 Block::bordered()
                     .title("Sort files")
-                    .style(cx.theme.common.base),
+                    .style(cx.components.listing.theme.common.base),
             )
             .highlight_symbol("> ")
-            .highlight_style(cx.theme.common.selected);
+            .highlight_style(cx.components.listing.theme.common.selected);
         frame.render_widget(Clear, area);
         frame.render_stateful_widget(
             list,

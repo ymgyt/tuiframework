@@ -30,8 +30,8 @@ use std::{error::Error, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
 use serde::Deserialize;
 use tuiframework::{
-    Component, Compositor, Driver, DriverContext, Effects, EventLoop, Hooks, RenderContext,
-    Terminal, TerminalOptions, Ui, UiKeymap,
+    Component, Overlay, Driver, DriverContext, Effects, EventLoop, Hooks, RenderInputs,
+    Terminal, TerminalOptions, Components, UiKeymap,
     crossterm::event::EventStream,
     keymap::KeymapConfig,
     ratatui::{Frame, style::{Color, Style}, widgets::Paragraph},
@@ -53,7 +53,7 @@ enum Event { Read(u64) }
 
 ## 2. Define the theme and register the screen
 
-`Clock` owns the screens and their shared theme. The clock adds a style for its time reading to the common styles. Its theme stays in the application so a settings change can replace it between frames. The single screen uses `()` as its address. The named `Clock` key layer also identifies its table in the settings file. The compositor draws the IDs returned by `visible` from back to front. It visits `ids` when publishing events, so a hidden screen can also receive a result.
+`Clock` owns the screens and their shared theme. The clock adds a style for its time reading to the common styles. Its theme stays in the application so a settings change can replace it between frames. The single screen uses `()` as its address. The named `Clock` key layer also identifies its table in the settings file. The root overlay lists the screens to draw, from back to front. Events reach subscribed components in registration order, including hidden screens.
 
 ```rust
 struct ClockTheme {
@@ -70,53 +70,51 @@ struct Clock {
 #[serde(rename_all = "lowercase")]
 enum Layer { Clock }
 
-impl Ui for Clock {
+impl Components for Clock {
     type Id = ();
     type Layer = Layer;
     type Command = Command;
     type Keymap = UiKeymap<Self>;
     type Event = Event;
     type Operation = Operation;
-    type Theme = ClockTheme;
-    type Context<'a> = RenderContext<'a, Self>;
+    type StackId = ();
+    type OverlayId = ();
+    type RenderContext<'a> = RenderInputs<'a, Self>;
 
-    fn theme(&self) -> &ClockTheme { &self.theme }
     fn ids(&self) -> impl IntoIterator<Item = ()> { [()] }
-    fn component(&self, _id: ()) -> Option<&dyn Component<Self>> { Some(&self.screen) }
-    fn component_mut(&mut self, _id: ()) -> Option<&mut dyn Component<Self>> {
+    fn get(&self, _id: ()) -> Option<&dyn Component<Self>> { Some(&self.screen) }
+    fn get_mut(&mut self, _id: ()) -> Option<&mut dyn Component<Self>> {
         Some(&mut self.screen)
     }
-    fn visible(&self) -> impl IntoIterator<Item = ()> { [()] }
 }
 
 ```
 
-## 3. Handle commands and draw the result
+## 3. Handle commands and render the result
 
-The screen declares which key layers it owns. Pressing a bound key calls its `command` method. The screen asks the driver to read the clock, then replaces its displayed value when the event arrives.
+The screen declares which key layers it owns. Pressing a bound key calls its `apply_command` method. The screen asks the driver to read the clock, then replaces its displayed value when the event arrives.
 
 ```rust
 impl Component<Clock> for ClockScreen {
     fn key_layers(&self) -> &[Layer] { &[Layer::Clock] }
 
-    fn apply_command(&mut self, command: Command) -> Effects<Clock> {
+    fn apply_command(&mut self, command: Command, effects: &mut Effects<Clock>) {
         match command {
-            Command::Refresh => Effects::NONE.operation(Operation::ReadClock),
-            Command::Quit => Effects::NONE.quit(),
+            Command::Refresh => effects.operation(Operation::ReadClock),
+            Command::Quit => effects.quit(),
         }
     }
 
     fn subscribes(&self, event: &Event) -> bool { matches!(event, Event::Read(_)) }
 
-    fn apply_event(&mut self, Event::Read(seconds): &Event) -> Effects<Clock> {
+    fn apply_event(&mut self, Event::Read(seconds): &Event, _: &mut Effects<Clock>) {
         self.seconds = Some(*seconds);
-        Effects::NONE
     }
 
-    fn render(&self, frame: &mut Frame<'_>, cx: &RenderContext<'_, Clock>) {
+    fn render(&self, frame: &mut Frame<'_>, cx: &RenderInputs<'_, Clock>) {
         let (text, style) = match self.seconds {
-            Some(s) => (format!("Unix time {s}"), cx.theme.reading),
-            None => ("Reading…".into(), cx.theme.common.muted),
+            Some(s) => (format!("Unix time {s}"), cx.components.theme.reading),
+            None => ("Reading…".into(), cx.components.theme.common.muted),
         };
         frame.render_widget(Paragraph::new(text).style(style), cx.area);
     }
@@ -189,10 +187,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
     let (theme, keys) = settings(path)?;
     let clock = Clock { screen: ClockScreen::default(), theme };
-    let hooks = Hooks::default().on_start(Box::new(|_, _| Effects::NONE.send((), Command::Refresh)));
+    let hooks = Hooks::default().on_start(Box::new(|_, _, effects| effects.operation(Operation::ReadClock)));
     let options = TerminalOptions::default().with_restore_on_panic_abort(true);
     EventLoop::builder()
-        .compositor(Compositor::new(clock, keys))
+        .components(clock)
+        .overlay(Overlay::new().component(()))
+        .keymap(keys)
         .driver(SystemClock)
         .terminal(Terminal::init(options)?)
         .input(EventStream::new())
@@ -228,7 +228,7 @@ cargo run -- settings.toml
 
 ## Add a second screen
 
-Give each screen an ID and return the open screens from `visible`. When two screens declare the same layer, its bound command goes to the frontmost one. To see this in the file browser, run the following command from the framework checkout.
+Give each screen an ID and declare their initial drawing order with `Overlay`. When two screens declare the same layer, its bound command goes to the frontmost one. To see this in the file browser, run the following command from the framework checkout.
 
 ```sh
 cargo run --example files -- .

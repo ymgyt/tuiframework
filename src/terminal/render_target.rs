@@ -7,17 +7,17 @@ use ratatui::{
 pub trait RenderTarget {
     type Error: std::error::Error;
 
-    /// Draws one frame.
-    fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<(), Self::Error>;
+    /// Renders one frame to the terminal.
+    fn render(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<(), Self::Error>;
 
-    /// Invalidates the previous frame so the next draw repaints the whole screen.
+    /// Invalidates the previous frame so the next render repaints the whole screen.
     fn force_redraw(&mut self) -> Result<(), Self::Error>;
 }
 
 impl<B: Backend> RenderTarget for ratatui::Terminal<B> {
     type Error = B::Error;
 
-    fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<(), Self::Error> {
+    fn render(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<(), Self::Error> {
         ratatui::Terminal::draw(self, render).map(|_| ())
     }
 
@@ -32,8 +32,8 @@ impl<B: Backend> RenderTarget for ratatui::Terminal<B> {
 impl<T: RenderTarget> RenderTarget for &mut T {
     type Error = T::Error;
 
-    fn draw(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<(), Self::Error> {
-        (**self).draw(render)
+    fn render(&mut self, render: impl FnOnce(&mut Frame<'_>)) -> Result<(), Self::Error> {
+        (**self).render(render)
     }
 
     fn force_redraw(&mut self) -> Result<(), Self::Error> {

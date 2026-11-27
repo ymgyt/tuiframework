@@ -1,22 +1,18 @@
-use std::ops::ControlFlow;
-
-use crossterm::event::{Event as TerminalEvent, KeyEventKind};
-use ratatui::Frame;
-
 use crate::{
-    Ui,
-    component::{Effects, RenderContext},
+    ApplicationEffects, Components, Effects, Overlay, RenderInputs,
     keymap::{KeyBindings as _, KeyStroke, LayerStack},
 };
+use crossterm::event::{Event as TerminalEvent, KeyEventKind};
+use ratatui::Frame;
+use std::ops::ControlFlow;
 
-/// Window focus reported by the terminal and passed to components when rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalFocus {
     Gained,
     Lost,
 }
 
-/// External operations and loop control produced by a completed UI transition.
+/// Operations and loop control resulting from a screen transition.
 #[derive(Debug)]
 #[must_use]
 pub struct DispatchResult<O> {
@@ -24,37 +20,53 @@ pub struct DispatchResult<O> {
     pub control_flow: ControlFlow<()>,
 }
 
-/// Routes inputs and facts to the app's components and draws the visible stack.
-pub struct Compositor<U: Ui> {
-    pub ui: U,
-    keymap: U::Keymap,
-    visible: Vec<U::Id>,
-    layers: LayerStack<U::Layer, U::Id>,
+impl<O> Default for DispatchResult<O> {
+    fn default() -> Self {
+        Self {
+            operations: Vec::new(),
+            control_flow: ControlFlow::Continue(()),
+        }
+    }
+}
+
+/// Owns screen composition and input routing. Also available as a headless test fixture.
+pub struct Compositor<C: Components> {
+    pub components: C,
+    keymap: C::Keymap,
+    overlay: Overlay<C>,
+    shown: Vec<C::Id>,
+    layers: LayerStack<C::Layer, C::Id>,
     focus: TerminalFocus,
 }
 
-impl<U: Ui> Compositor<U> {
-    pub fn new(ui: U, keymap: U::Keymap) -> Self {
-        let mut compositor = Self {
-            ui,
+impl<C: Components> Compositor<C> {
+    pub fn new(components: C, overlay: Overlay<C>, keymap: C::Keymap) -> Self {
+        overlay.check_names(&mut Vec::new(), &mut Vec::new());
+        let mut screens = Self {
+            components,
+            overlay,
             keymap,
-            visible: Vec::new(),
+            shown: Vec::new(),
             layers: LayerStack::default(),
             focus: TerminalFocus::Gained,
         };
-        compositor.refresh();
-        compositor
+        screens.refresh();
+        screens
     }
 
-    /// Rebuilds the display order and layers after direct changes to app state.
-    /// Input and event dispatch already do this after applying their effects.
     pub fn refresh(&mut self) {
-        self.ui.update_keymap(&mut self.keymap);
-        self.visible.clear();
-        self.visible.extend(self.ui.visible());
+        self.shown.clear();
+        self.overlay.shown(&self.components, &mut self.shown);
+        self.shown.retain(|id| self.components.get(*id).is_some());
+        let registered: Vec<_> = self.components.ids().into_iter().collect();
+        for id in registered {
+            if let Some(component) = self.components.get_mut(id) {
+                component.update_keymap(&mut self.keymap);
+            }
+        }
         self.layers.clear();
-        for &id in &self.visible {
-            if let Some(component) = self.ui.component(id) {
+        for &id in &self.shown {
+            if let Some(component) = self.components.get(id) {
                 component.mask_lower_layers(&mut self.layers);
                 self.layers.extend(id, component.key_layers());
             }
@@ -63,175 +75,191 @@ impl<U: Ui> Compositor<U> {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>) {
-        let cx = U::Context::from(RenderContext {
-            ui: &self.ui,
-            theme: self.ui.theme(),
+        let cx = C::RenderContext::from(RenderInputs {
+            components: &self.components,
             area: frame.area(),
             focus: self.focus,
             keymap: &self.keymap,
             layers: &self.layers,
         });
-        for &id in &self.visible {
-            if let Some(component) = self.ui.component(id) {
+        for &id in &self.shown {
+            if let Some(component) = self.components.get(id) {
                 component.render(frame, &cx);
             }
         }
     }
 
-    /// Resolves a key against the current layers without applying its command.
-    pub fn resolve_key(&mut self, key: KeyStroke) -> Option<(U::Id, U::Command)> {
+    pub fn resolve_key(&mut self, key: KeyStroke) -> Option<(C::Id, C::Command)> {
         self.keymap.resolve_command(&self.layers, key)
     }
 
+    pub fn is_busy(&self) -> bool {
+        self.components.ids().into_iter().any(|id| {
+            self.components
+                .get(id)
+                .is_some_and(crate::Component::is_busy)
+        })
+    }
+
     pub(crate) fn tick(&mut self) {
-        self.ui.tick();
+        let ids: Vec<_> = self.components.ids().into_iter().collect();
+        for id in ids {
+            if let Some(component) = self.components.get_mut(id)
+                && component.is_busy()
+            {
+                component.tick();
+            }
+        }
         self.refresh();
+    }
+
+    pub fn apply_terminal_event(&mut self, input: &TerminalEvent) -> DispatchResult<C::Operation> {
+        let mut result = DispatchResult::default();
+        if matches!(input, TerminalEvent::Key(key) if key.kind == KeyEventKind::Release) {
+            return result;
+        }
+        let command = match input {
+            TerminalEvent::FocusLost => {
+                self.focus = TerminalFocus::Lost;
+                self.keymap.cancel_pending();
+                None
+            }
+            TerminalEvent::FocusGained => {
+                self.focus = TerminalFocus::Gained;
+                None
+            }
+            TerminalEvent::Key(key) => self.resolve_key((*key).into()),
+            _ => None,
+        };
+        let top = self.shown.last().copied();
+        let ids: Vec<_> = self.components.ids().into_iter().collect();
+        for id in ids {
+            if let Some(component) = self.components.get_mut(id) {
+                let mut effects = Effects::default();
+                component.on_input(input, Some(id) == top, &mut effects);
+                self.finish(id, effects, &mut result);
+            }
+        }
+        if let Some((id, command)) = command {
+            self.command(id, command, &mut result);
+        }
+        self.refresh();
+        result
+    }
+
+    fn command(
+        &mut self,
+        id: C::Id,
+        command: C::Command,
+        result: &mut DispatchResult<C::Operation>,
+    ) {
+        if let Some(component) = self.components.get_mut(id) {
+            let mut effects = Effects::default();
+            component.apply_command(command, &mut effects);
+            self.finish(id, effects, result);
+        }
     }
 
     pub fn apply_command(
         &mut self,
-        to: U::Id,
-        command: U::Command,
-    ) -> DispatchResult<U::Operation> {
-        self.dispatch(vec![Dispatch::Command(to, command)])
-    }
-
-    pub fn apply_terminal_event(&mut self, input: &TerminalEvent) -> DispatchResult<U::Operation> {
-        if matches!(input, TerminalEvent::Key(key) if key.kind == KeyEventKind::Release) {
-            return DispatchResult {
-                operations: Vec::new(),
-                control_flow: ControlFlow::Continue(()),
-            };
-        }
-        let mut effects = self.ui.on_input(input);
-        match input {
-            TerminalEvent::FocusLost => {
-                self.focus = TerminalFocus::Lost;
-                self.keymap.cancel_pending();
-            }
-            TerminalEvent::FocusGained => self.focus = TerminalFocus::Gained,
-            TerminalEvent::Key(key) => {
-                if let Some((owner, command)) = self.resolve_key((*key).into()) {
-                    effects = effects.send(owner, command);
-                }
-            }
-            _ => {}
-        }
-        self.apply_effects(effects)
-    }
-
-    pub fn apply_event(&mut self, event: &U::Event) -> DispatchResult<U::Operation> {
-        let mut pending = Vec::new();
-        self.notify(std::slice::from_ref(event), &mut pending);
-        self.dispatch(pending)
-    }
-
-    pub(crate) fn apply_effects(&mut self, effects: Effects<U>) -> DispatchResult<U::Operation> {
-        let mut pending = Vec::new();
-        self.enqueue(effects, &mut pending);
-        self.dispatch(pending)
-    }
-
-    fn enqueue(&mut self, mut effects: Effects<U>, pending: &mut Vec<Dispatch<U>>) {
-        let events = std::mem::take(&mut effects.events);
-        // The originating reply runs after the replies to the facts it emitted.
-        Dispatch::push_reply(pending, effects);
-        self.notify(&events, pending);
-    }
-
-    fn dispatch(&mut self, mut pending: Vec<Dispatch<U>>) -> DispatchResult<U::Operation> {
-        let mut operations = Vec::new();
-        let mut control_flow = ControlFlow::Continue(());
-        while let Some(next) = pending.pop() {
-            match next {
-                Dispatch::Reply(reply) => {
-                    if reply.quit {
-                        control_flow = ControlFlow::Break(());
-                    }
-                    operations.extend(reply.operations);
-                    pending.extend(
-                        reply
-                            .commands
-                            .into_iter()
-                            .rev()
-                            .map(|(id, cmd)| Dispatch::Command(id, cmd)),
-                    );
-                }
-                Dispatch::Command(to, command) => {
-                    // A preceding command can have closed the addressed component.
-                    if self.ui.component(to).is_some() {
-                        let reply = self.ui.apply_command(to, command);
-                        self.enqueue(reply, &mut pending);
-                    }
-                }
-            }
-        }
+        id: C::Id,
+        command: C::Command,
+    ) -> DispatchResult<C::Operation> {
+        let mut result = DispatchResult::default();
+        self.command(id, command, &mut result);
         self.refresh();
-        DispatchResult {
-            operations,
-            control_flow,
-        }
+        result
     }
 
-    /// Finish notifying every subscriber before any of their commands runs.
-    fn notify(&mut self, events: &[U::Event], pending: &mut Vec<Dispatch<U>>) {
-        if events.is_empty() {
-            return;
+    pub fn apply_event(&mut self, event: &C::Event) -> DispatchResult<C::Operation> {
+        let mut result = DispatchResult::default();
+        self.notify(std::slice::from_ref(event), &mut result);
+        self.refresh();
+        result
+    }
+
+    pub(crate) fn apply_effects(
+        &mut self,
+        effects: ApplicationEffects<C>,
+    ) -> DispatchResult<C::Operation> {
+        let mut result = DispatchResult::default();
+        self.notify(&effects.events, &mut result);
+        result.extend(effects.operations, effects.quit);
+        self.refresh();
+        result
+    }
+
+    fn finish(
+        &mut self,
+        id: C::Id,
+        effects: Effects<C>,
+        result: &mut DispatchResult<C::Operation>,
+    ) {
+        for change in effects.display {
+            self.overlay.apply(id, &change);
         }
-        let first_reply = pending.len();
-        let mut notifications = vec![Notification::new(Publication::Borrowed(events))];
-        while let Some(notification) = notifications.last_mut() {
-            let Some((id, event)) = notification.next(&self.ui) else {
-                let finished = notifications.pop().expect("current notification");
-                if let Publication::Reply(mut reply) = finished.publication {
-                    reply.events.clear();
-                    Dispatch::push_reply(pending, reply);
+        if !effects.app.events.is_empty() {
+            self.notify(&effects.app.events, result);
+        }
+        result.extend(effects.app.operations, effects.app.quit);
+    }
+
+    /// Nested events complete before the next subscriber sees the parent event.
+    /// A new event snapshots the current registry; removed recipients are skipped.
+    fn notify(&mut self, events: &[C::Event], result: &mut DispatchResult<C::Operation>) {
+        let mut pending = vec![Notification::new(Publication::Borrowed(events))];
+        while let Some(current) = pending.last_mut() {
+            let Some((id, event)) = current.next(&self.components) else {
+                if let Some(Notification {
+                    publication: Publication::Reply(reply),
+                    ..
+                }) = pending.pop()
+                {
+                    result.extend(reply.operations, reply.quit);
                 }
                 continue;
             };
-            if let Some(component) = self.ui.component_mut(id)
+            if let Some(component) = self.components.get_mut(id)
                 && component.subscribes(event)
             {
-                let reply = component.apply_event(event);
-                if reply.events.is_empty() {
-                    Dispatch::push_reply(pending, reply);
+                let mut effects = Effects::default();
+                component.apply_event(event, &mut effects);
+                for change in effects.display {
+                    self.overlay.apply(id, &change);
+                }
+                if effects.app.events.is_empty() {
+                    result.extend(effects.app.operations, effects.app.quit);
                 } else {
-                    notifications.push(Notification::new(Publication::Reply(reply)));
+                    pending.push(Notification::new(Publication::Reply(effects.app)));
                 }
             }
         }
-        // Replies were collected in delivery order. The dispatch stack pops from its end.
-        pending[first_reply..].reverse();
     }
 }
 
-enum Dispatch<U: Ui> {
-    Reply(Effects<U>),
-    Command(U::Id, U::Command),
-}
-
-impl<U: Ui> Dispatch<U> {
-    fn push_reply(pending: &mut Vec<Self>, reply: Effects<U>) {
-        if reply.quit || !reply.commands.is_empty() || !reply.operations.is_empty() {
-            pending.push(Self::Reply(reply));
+impl<O> DispatchResult<O> {
+    fn extend(&mut self, operations: Vec<O>, quit: bool) {
+        self.operations.extend(operations);
+        if quit {
+            self.control_flow = ControlFlow::Break(());
         }
     }
 }
 
 /// External events can be borrowed; a component's reply owns its nested events.
-enum Publication<'a, U: Ui> {
+enum Publication<'a, U: Components> {
     Borrowed(&'a [U::Event]),
-    Reply(Effects<U>),
+    Reply(ApplicationEffects<U>),
 }
 
 /// The sibling subscribers and events to resume after a nested notification.
-struct Notification<'a, U: Ui> {
+struct Notification<'a, U: Components> {
     publication: Publication<'a, U>,
     event: usize,
     recipients: Option<std::vec::IntoIter<U::Id>>,
 }
 
-impl<'a, U: Ui> Notification<'a, U> {
+impl<'a, U: Components> Notification<'a, U> {
     fn new(publication: Publication<'a, U>) -> Self {
         Self {
             publication,
@@ -264,7 +292,7 @@ mod tests {
     use super::*;
     use crate::{Component, UiKeymap};
 
-    #[derive(Clone, Copy, Eq, PartialEq)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     enum Id {
         Window,
         Tab,
@@ -279,8 +307,9 @@ mod tests {
     }
     #[derive(Clone)]
     enum Command {
-        Count(u16),
-        Select,
+        Push,
+        Open,
+        Close,
     }
 
     #[derive(Default)]
@@ -288,109 +317,94 @@ mod tests {
         tab: Option<Tab>,
     }
     #[derive(Default)]
-    struct Tab {
-        saw_selection: bool,
-    }
+    struct Tab;
 
-    impl Ui for Window {
+    impl Components for Window {
         type Id = Id;
         type Command = Command;
         type Event = Event;
         type Operation = &'static str;
-        type Theme = ();
+        type OverlayId = ();
+        type StackId = ();
         type Layer = ();
         type Keymap = UiKeymap<Self>;
-        type Context<'a> = RenderContext<'a, Self>;
+        type RenderContext<'a> = RenderInputs<'a, Self>;
 
-        fn theme(&self) -> &() {
-            &()
-        }
         fn ids(&self) -> impl IntoIterator<Item = Id> {
             std::iter::once(Id::Window).chain(self.tab.as_ref().map(|_| Id::Tab))
         }
-        fn visible(&self) -> impl IntoIterator<Item = Id> {
-            [Id::Window]
-        }
-        fn component(&self, id: Id) -> Option<&dyn Component<Self>> {
+        fn get(&self, id: Id) -> Option<&dyn Component<Self>> {
             match id {
                 Id::Window => Some(self),
                 Id::Tab => self.tab.as_ref().map(|tab| tab as &dyn Component<Self>),
             }
         }
-        fn component_mut(&mut self, id: Id) -> Option<&mut dyn Component<Self>> {
+        fn get_mut(&mut self, id: Id) -> Option<&mut dyn Component<Self>> {
             match id {
                 Id::Window => Some(self),
                 Id::Tab => self.tab.as_mut().map(|tab| tab as &mut dyn Component<Self>),
             }
         }
-        fn apply_command(&mut self, to: Id, command: Command) -> Effects<Self> {
-            self.component_mut(to)
-                .expect("a command has a live recipient")
-                .apply_command(command)
-        }
     }
 
     impl Component<Window> for Window {
-        fn render(&self, _: &mut Frame<'_>, _: &RenderContext<'_, Window>) {}
+        fn render(&self, _: &mut Frame<'_>, _: &RenderInputs<'_, Window>) {}
         fn subscribes(&self, _: &Event) -> bool {
             true
         }
-        fn apply_event(&mut self, event: &Event) -> Effects<Window> {
+        fn apply_event(&mut self, event: &Event, effects: &mut Effects<Window>) {
             match event {
-                Event::Count(0) => Effects::NONE.send(Id::Window, Command::Count(20_000)),
-                Event::Count(n) => Effects::NONE.emit(Event::Count(n - 1)),
+                Event::Count(0) => effects.operation("finished"),
+                Event::Count(n) => effects.emit(Event::Count(n - 1)),
                 Event::Open => {
-                    self.tab = Some(Tab::default());
-                    Effects::NONE.emit(Event::Opened)
+                    self.tab = Some(Tab);
+                    effects.emit(Event::Opened);
                 }
                 Event::Close => {
                     self.tab = None;
-                    Effects::NONE.send(Id::Tab, Command::Select)
                 }
-                Event::Opened => Effects::NONE,
-                Event::SelectTab => Effects::NONE
-                    .emit(Event::Opened)
-                    .operation("window")
-                    .send(Id::Tab, Command::Select),
-            }
-        }
-        fn apply_command(&mut self, command: Command) -> Effects<Window> {
-            match command {
-                Command::Count(0) => Effects::NONE.operation("finished"),
-                Command::Count(n) => Effects::NONE.send(Id::Window, Command::Count(n - 1)),
-                Command::Select => unreachable!(),
+                Event::Opened => {}
+                Event::SelectTab => {
+                    effects.emit(Event::Opened);
+                    effects.operation("window");
+                }
             }
         }
     }
 
     impl Component<Window> for Tab {
-        fn render(&self, _: &mut Frame<'_>, _: &RenderContext<'_, Window>) {}
+        fn render(&self, _: &mut Frame<'_>, _: &RenderInputs<'_, Window>) {}
         fn subscribes(&self, _: &Event) -> bool {
             true
         }
-        fn apply_event(&mut self, event: &Event) -> Effects<Window> {
+        fn apply_event(&mut self, event: &Event, effects: &mut Effects<Window>) {
             match event {
-                Event::Opened => Effects::NONE.operation("opened"),
+                Event::Opened => effects.operation("opened"),
                 Event::SelectTab => {
-                    self.saw_selection = true;
-                    Effects::NONE.operation("tab")
+                    effects.operation("tab");
                 }
                 _ => panic!("tab received an event outside its lifetime"),
             }
         }
-        fn apply_command(&mut self, command: Command) -> Effects<Window> {
-            assert!(matches!(command, Command::Select));
-            assert!(
-                self.saw_selection,
-                "publish to every subscriber before running commands"
-            );
-            Effects::NONE.operation("selected")
+        fn key_layers(&self) -> &[()] {
+            &[()]
+        }
+        fn apply_command(&mut self, command: Command, effects: &mut Effects<Window>) {
+            match command {
+                Command::Push => effects.push(()),
+                Command::Open => effects.open(()),
+                Command::Close => effects.close(),
+            }
         }
     }
 
     #[test]
-    fn finite_event_and_command_chains_finish_without_using_the_call_stack() {
-        let mut ui = Compositor::new(Window::default(), UiKeymap::<Window>::default());
+    fn finite_event_chains_finish_without_using_the_call_stack() {
+        let mut ui = Compositor::new(
+            Window::default(),
+            Overlay::new().component(Id::Window),
+            UiKeymap::<Window>::default(),
+        );
         assert_eq!(
             ui.apply_event(&Event::Count(20_000)).operations,
             ["finished"]
@@ -399,20 +413,53 @@ mod tests {
 
     #[test]
     fn nested_events_see_new_tabs_and_closing_a_tab_drops_late_deliveries() {
-        let mut ui = Compositor::new(Window::default(), UiKeymap::<Window>::default());
+        let mut ui = Compositor::new(
+            Window::default(),
+            Overlay::new().component(Id::Window),
+            UiKeymap::<Window>::default(),
+        );
         assert_eq!(ui.apply_event(&Event::Open).operations, ["opened"]);
         assert_eq!(ui.apply_event(&Event::Close).operations, [] as [&str; 0]);
     }
 
     #[test]
     fn nested_replies_run_before_their_parent_and_its_siblings() {
-        let window = Window {
-            tab: Some(Tab::default()),
-        };
-        let mut ui = Compositor::new(window, UiKeymap::<Window>::default());
+        let window = Window { tab: Some(Tab) };
+        let mut ui = Compositor::new(
+            window,
+            Overlay::new().component(Id::Window),
+            UiKeymap::<Window>::default(),
+        );
         assert_eq!(
             ui.apply_event(&Event::SelectTab).operations,
-            ["opened", "window", "selected", "tab"]
+            ["opened", "window", "tab"]
         );
+    }
+
+    #[test]
+    fn a_nested_stack_and_popup_share_the_active_branch_with_input() {
+        let window = Window { tab: Some(Tab) };
+        let branch = Overlay::named(()).stack((), Overlay::new().component(Id::Window));
+        let overlay = Overlay::new().switch(
+            |window: &Window| window.tab.is_some(),
+            [
+                (true, branch),
+                (false, Overlay::new().component(Id::Window)),
+            ],
+        );
+        let mut screens = Compositor::new(window, overlay, UiKeymap::<Window>::default());
+        let _ = screens.apply_command(Id::Tab, Command::Push);
+        assert_eq!(screens.shown, [Id::Tab]);
+        assert_eq!(screens.layers.owner(()), Some(Id::Tab));
+        let _ = screens.apply_command(Id::Tab, Command::Open);
+        assert_eq!(screens.shown, [Id::Window, Id::Tab]);
+        screens.components.tab = None;
+        screens.refresh();
+        assert_eq!(screens.shown, [Id::Window]);
+        assert_eq!(screens.layers.owner(()), None);
+        screens.components.tab = Some(Tab);
+        screens.refresh();
+        let _ = screens.apply_command(Id::Tab, Command::Close);
+        assert_eq!(screens.shown, [Id::Window]);
     }
 }

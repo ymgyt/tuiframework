@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::event_loop::Redraw;
+use crate::event_loop::RenderMode;
 use futures_util::{
     FutureExt as _, Stream, StreamExt as _,
     future::{AbortHandle, BoxFuture},
@@ -148,12 +148,15 @@ impl<E> DriverEvents<E> {
 /// Capabilities lent to one driver dispatch. Submitted work belongs to the event loop.
 pub struct DriverContext<'a, E> {
     events: &'a mut DriverEvents<E>,
-    redraw: &'a mut Redraw,
+    next_render: &'a mut RenderMode,
 }
 
 impl<'a, E> DriverContext<'a, E> {
-    pub(crate) fn new(events: &'a mut DriverEvents<E>, redraw: &'a mut Redraw) -> Self {
-        Self { events, redraw }
+    pub(crate) fn new(events: &'a mut DriverEvents<E>, next_render: &'a mut RenderMode) -> Self {
+        Self {
+            events,
+            next_render,
+        }
     }
     /// Queues a result from a synchronous operation.
     pub fn emit(&self, event: E) {
@@ -197,9 +200,9 @@ impl<'a, E> DriverContext<'a, E> {
         handle
     }
 
-    /// Repaints the entire fullscreen terminal after an external program has used it.
+    /// Requests a full repaint on the next render after an external program has used the terminal.
     pub fn force_redraw(&mut self) {
-        *self.redraw = Redraw::Full;
+        *self.next_render = RenderMode::Full;
     }
 }
 
@@ -220,9 +223,9 @@ mod tests {
     #[tokio::test]
     async fn requests_preserve_progress_order_while_other_work_can_finish() {
         let mut events = DriverEvents::new();
-        let mut redraw = Redraw::Diff;
+        let mut next_render = RenderMode::Diff;
         let (resume, wait) = oneshot::channel();
-        DriverContext::new(&mut events, &mut redraw).request(|request| {
+        DriverContext::new(&mut events, &mut next_render).request(|request| {
             let id = request.id();
             (Event::Start(id), async move {
                 wait.await.unwrap();
@@ -233,7 +236,7 @@ mod tests {
         let Event::Start(first) = events.next_event().await else {
             panic!("expected request start")
         };
-        DriverContext::new(&mut events, &mut redraw).request(|request| {
+        DriverContext::new(&mut events, &mut next_render).request(|request| {
             let id = request.id();
             (Event::Start(id), async move { Event::Done(id) })
         });
@@ -251,9 +254,9 @@ mod tests {
     #[tokio::test]
     async fn progress_emitted_while_building_a_request_follows_its_start() {
         let mut events = DriverEvents::new();
-        let mut redraw = Redraw::Diff;
-        DriverContext::new(&mut events, &mut redraw).emit(Event::Other);
-        DriverContext::new(&mut events, &mut redraw).request(|request| {
+        let mut next_render = RenderMode::Diff;
+        DriverContext::new(&mut events, &mut next_render).emit(Event::Other);
+        DriverContext::new(&mut events, &mut next_render).request(|request| {
             request.emit(Event::Progress).unwrap();
             (Event::Start(request.id()), async move {
                 Event::Done(request.id())
@@ -270,11 +273,11 @@ mod tests {
     #[tokio::test]
     async fn a_busy_event_queue_allows_one_shot_work_to_progress() {
         let mut events = DriverEvents::new();
-        let mut redraw = Redraw::Diff;
-        DriverContext::new(&mut events, &mut redraw)
+        let mut next_render = RenderMode::Diff;
+        DriverContext::new(&mut events, &mut next_render)
             .submit(async { Event::Done(RequestId::new(0)) });
         for _ in 0..1024 {
-            DriverContext::new(&mut events, &mut redraw).emit(Event::Other);
+            DriverContext::new(&mut events, &mut next_render).emit(Event::Other);
             if matches!(events.next_event().await, Event::Done(_)) {
                 return;
             }
@@ -285,13 +288,13 @@ mod tests {
     #[tokio::test]
     async fn cancelling_a_watch_leaves_the_queue_usable() {
         let mut events = DriverEvents::new();
-        let mut redraw = Redraw::Diff;
-        let watch = DriverContext::new(&mut events, &mut redraw)
+        let mut next_render = RenderMode::Diff;
+        let watch = DriverContext::new(&mut events, &mut next_render)
             .watch(stream::repeat_with(|| Event::Other));
         assert_eq!(events.next_event().await, Event::Other);
         watch.abort();
         assert!(events.next_event().now_or_never().is_none());
-        DriverContext::new(&mut events, &mut redraw).submit(async { Event::Other });
+        DriverContext::new(&mut events, &mut next_render).submit(async { Event::Other });
         assert_eq!(events.next_event().await, Event::Other);
     }
 }
