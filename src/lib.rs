@@ -20,6 +20,6 @@ pub use compositor::{Compositor, DispatchResult, TerminalFocus};
 pub use driver::{Driver, DriverContext};
 pub use event_loop::{AnimationTimer, EventLoop, EventLoopBuilder, Hooks, RunError};
 pub use keymap::{KeyAction, UiKeymap};
-pub use terminal::{RenderTarget, Terminal, TerminalDevice, TerminalOptions};
+pub use terminal::{RenderTarget, Terminal, TerminalOptions};
 pub use ui::Ui;
 pub use {crossterm, ratatui};

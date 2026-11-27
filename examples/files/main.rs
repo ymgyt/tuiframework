@@ -3,7 +3,7 @@ use std::{env, error::Error, io, path::PathBuf, sync::Arc};
 use serde::Deserialize;
 use tuiframework::{
     Component, Compositor, Driver, DriverContext, Effects, EventLoop, Hooks, Terminal,
-    TerminalDevice, TerminalOptions, Ui, UiKeymap,
+    TerminalOptions, Ui, UiKeymap,
     crossterm::event::EventStream,
     keymap::KeymapConfig,
     ratatui::style::Style,
@@ -184,12 +184,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let hooks = Hooks::default().on_start(Box::new(|_, _| {
         Effects::NONE.send(Id::Files, Command::Reload)
     }));
-    let mut device = TerminalDevice::stdout();
-    device.install_abort_hook();
+    let options = TerminalOptions::default().with_restore_on_panic_abort(true);
     EventLoop::builder()
         .compositor(Compositor::new(files, keymap()?))
         .driver(FileSystem)
-        .terminal(Terminal::init(&mut device, TerminalOptions::default())?)
+        .terminal(Terminal::init(options)?)
         .input(EventStream::new())
         .hooks(hooks)
         .build()

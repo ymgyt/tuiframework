@@ -31,7 +31,7 @@ use std::{error::Error, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 use serde::Deserialize;
 use tuiframework::{
     Component, Compositor, Driver, DriverContext, Effects, EventLoop, Hooks, RenderContext,
-    Terminal, TerminalDevice, TerminalOptions, Ui, UiKeymap,
+    Terminal, TerminalOptions, Ui, UiKeymap,
     crossterm::event::EventStream,
     keymap::KeymapConfig,
     ratatui::{Frame, style::{Color, Style}, widgets::Paragraph},
@@ -190,12 +190,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (theme, keys) = settings(path)?;
     let clock = Clock { screen: ClockScreen::default(), theme };
     let hooks = Hooks::default().on_start(Box::new(|_, _| Effects::NONE.send((), Command::Refresh)));
-    let mut device = TerminalDevice::stdout();
-    device.install_abort_hook();
+    let options = TerminalOptions::default().with_restore_on_panic_abort(true);
     EventLoop::builder()
         .compositor(Compositor::new(clock, keys))
         .driver(SystemClock)
-        .terminal(Terminal::init(&mut device, TerminalOptions::default())?)
+        .terminal(Terminal::init(options)?)
         .input(EventStream::new())
         .hooks(hooks)
         .build()

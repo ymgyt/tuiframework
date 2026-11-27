@@ -26,7 +26,7 @@ pub(crate) enum Redraw {
 /// ```compile_fail,E0599
 /// # use tuiframework::{Driver, EventLoop, Terminal, Ui, crossterm::event::EventStream, event_loop::Ready};
 /// # fn example<U: Ui, D: Driver<Event = U::Event, Operation = U::Operation>>(
-/// #     mut ready: EventLoop<Ready<'_, U, D>, Terminal<'_>, EventStream>) {
+/// #     mut ready: EventLoop<Ready<'_, U, D>, Terminal, EventStream>) {
 /// let _ = ready.process_next();
 /// # }
 /// ```
@@ -109,7 +109,7 @@ where
     /// ```compile_fail,E0599
     /// # use tuiframework::{Driver, EventLoop, Terminal, Ui, crossterm::event::EventStream, event_loop::Ready};
     /// # fn example<U: Ui, D: Driver<Event = U::Event, Operation = U::Operation>>(
-    /// #     ready: EventLoop<Ready<'_, U, D>, Terminal<'_>, EventStream>) {
+    /// #     ready: EventLoop<Ready<'_, U, D>, Terminal, EventStream>) {
     /// let started = ready.start();
     /// started.start();
     /// # }
